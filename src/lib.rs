@@ -20,11 +20,11 @@
 //! flow that coordinates Session, Identity, Prompt Builder, Provider,
 //! and Tool Router capsules over the event bus.
 
-use astrid_events::ipc::IpcPayload;
-use astrid_events::llm::{
-    LlmToolDefinition, Message, MessageContent, MessageRole, StreamEvent, ToolCall, ToolCallResult,
-};
 use astrid_sdk::prelude::*;
+use astrid_sdk::types::{
+    IpcPayload, LlmToolDefinition, Message, MessageContent, MessageRole, StreamEvent, ToolCall,
+    ToolCallResult,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,7 +117,9 @@ fn delete_call_sessions(call_ids: &[String]) {
 /// Load the set of active session IDs from KV.
 fn load_active_sessions() -> Vec<String> {
     kv::get_json::<Vec<String>>(ACTIVE_SESSIONS_KEY).unwrap_or_else(|e| {
-        let _ = log::warn(format!("Failed to load active sessions from KV, defaulting to empty: {e}"));
+        let _ = log::warn(format!(
+            "Failed to load active sessions from KV, defaulting to empty: {e}"
+        ));
         Vec::new()
     })
 }
@@ -128,7 +130,9 @@ fn register_active_session(session_id: &str) {
     if !sessions.iter().any(|s| s == session_id) {
         sessions.push(session_id.to_string());
         if let Err(e) = kv::set_json(ACTIVE_SESSIONS_KEY, &sessions) {
-            let _ = log::error(format!("Failed to register active session '{session_id}': {e}"));
+            let _ = log::error(format!(
+                "Failed to register active session '{session_id}': {e}"
+            ));
         }
     }
 }
@@ -138,19 +142,15 @@ fn register_active_session(session_id: &str) {
 /// Called on capsule restart to prevent stale turn state, correlation
 /// mappings, and active-session lists from persisting across restarts.
 fn clear_ephemeral_keys() {
-    for prefix in [
-        "react.turn.",
-        "react.req2sess.",
-        "react.call2sess.",
-    ] {
+    for prefix in ["react.turn.", "react.req2sess.", "react.call2sess."] {
         match kv::clear_prefix(prefix) {
             Ok(n) if n > 0 => {
                 let _ = log::info(format!("Cleared {n} ephemeral keys with prefix '{prefix}'"));
-            },
+            }
             Err(e) => {
                 let _ = log::warn(format!("Failed to clear ephemeral keys '{prefix}': {e}"));
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
     if let Err(e) = kv::delete(ACTIVE_SESSIONS_KEY) {
@@ -180,7 +180,9 @@ fn get_config_u64(key: &str, default: u64) -> u64 {
             Err(e) => {
                 let _ = log::log(
                     "warn",
-                    format!("Invalid config for '{key}': \"{s}\", using default {default}. Error: {e}"),
+                    format!(
+                        "Invalid config for '{key}': \"{s}\", using default {default}. Error: {e}"
+                    ),
                 );
                 default
             }
@@ -364,7 +366,7 @@ impl TurnState {
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
         self.phase_entered_at_ms = time::now_ms().unwrap_or(0);
-        if phase == Phase::Idle {
+        if self.phase == Phase::Idle {
             unregister_active_session(&self.session_id);
         }
     }
@@ -391,7 +393,7 @@ impl TurnState {
         let (default_secs, config_key) = match self.phase {
             Phase::AwaitingIdentity | Phase::AwaitingPromptBuild => {
                 (DEFAULT_IDENTITY_TIMEOUT_SECS, "identity_timeout_secs")
-            },
+            }
             Phase::Streaming => (DEFAULT_STREAMING_TIMEOUT_SECS, "streaming_timeout_secs"),
             Phase::AwaitingTools => (DEFAULT_TOOL_TIMEOUT_SECS, "tool_timeout_secs"),
             Phase::Idle => return Ok(false),
@@ -528,21 +530,23 @@ impl ReactLoop {
         // Delete the old session's turn state - the session is done.
         let old_key = turn_key(old_session_id);
         if let Err(e) = kv::delete(&old_key) {
-            let _ = log::warn(format!("Failed to delete old turn state key '{old_key}': {e}"));
+            let _ = log::warn(format!(
+                "Failed to delete old turn state key '{old_key}': {e}"
+            ));
         }
         unregister_active_session(old_session_id);
 
         // Initialize a fresh turn state for the new session.
-        let mut new_state = TurnState::default();
-        new_state.session_id = new_session_id.clone();
+        let new_state = TurnState {
+            session_id: new_session_id.clone(),
+            ..TurnState::default()
+        };
         let key = turn_key(&new_session_id);
         kv::set_json(&key, &new_state)?;
 
         let _ = log::log(
             "info",
-            format!(
-                "Session cleared: '{old_session_id}' -> '{new_session_id}'"
-            ),
+            format!("Session cleared: '{old_session_id}' -> '{new_session_id}'"),
         );
 
         // Notify frontends of the session change.
@@ -616,10 +620,10 @@ impl ReactLoop {
 
         // Check for cancel signal before the empty-text guard, since
         // cancel is sent as empty text with context.action = "cancel_turn".
-        if let Some(ref ctx) = context {
-            if ctx.get("action").and_then(|v| v.as_str()) == Some("cancel_turn") {
-                return Self::handle_cancel(&session_id);
-            }
+        if let Some(ref ctx) = context
+            && ctx.get("action").and_then(|v| v.as_str()) == Some("cancel_turn")
+        {
+            return Self::handle_cancel(&session_id);
         }
 
         if text.trim().is_empty() {
@@ -713,8 +717,7 @@ impl ReactLoop {
 
         state.save()?;
 
-        let model =
-            env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
 
         // Derive the active provider from the registry's LLM topic.
         let llm_topic = Self::active_llm_topic();
@@ -833,7 +836,7 @@ impl ReactLoop {
                         session_id: state.session_id.clone(),
                     },
                 );
-            },
+            }
             StreamEvent::ToolCallStart { id, name } => {
                 state.pending_stream_tools.push(PendingToolCall {
                     id,
@@ -841,20 +844,20 @@ impl ReactLoop {
                     args_json: String::new(),
                     complete: false,
                 });
-            },
+            }
             StreamEvent::ToolCallDelta { id, args_delta } => {
                 if let Some(tc) = state.pending_stream_tools.iter_mut().find(|t| t.id == id) {
                     tc.args_json.push_str(&args_delta);
                 }
-            },
+            }
             StreamEvent::ToolCallEnd { id } => {
                 if let Some(tc) = state.pending_stream_tools.iter_mut().find(|t| t.id == id) {
                     tc.complete = true;
                 }
-            },
+            }
             StreamEvent::Done => {
                 return Self::handle_stream_done(&mut state);
-            },
+            }
             StreamEvent::Error(err) => {
                 let _ = log::error(format!("LLM stream error: {err}"));
                 let _ = ipc::publish_json(
@@ -872,9 +875,9 @@ impl ReactLoop {
                 state.set_phase(Phase::Idle);
                 state.save()?;
                 return Ok(());
-            },
+            }
             // Usage and ReasoningDelta are informational, no state change needed
-            _ => {},
+            _ => {}
         }
 
         state.save()?;
@@ -941,11 +944,17 @@ impl ReactLoop {
         // history. If we exceed the limit, we don't want orphaned tool-call
         // messages in history with no subsequent assistant response.
         state.iteration_count += 1;
-        let max_iterations =
-            u32::try_from(get_config_u64("max_iterations", u64::from(DEFAULT_MAX_ITERATIONS)))
-                .unwrap_or(DEFAULT_MAX_ITERATIONS);
+        let max_iterations = u32::try_from(get_config_u64(
+            "max_iterations",
+            u64::from(DEFAULT_MAX_ITERATIONS),
+        ))
+        .unwrap_or(DEFAULT_MAX_ITERATIONS);
 
-        let call_ids: Vec<String> = state.dispatched_tools.iter().map(|t| t.id.clone()).collect();
+        let call_ids: Vec<String> = state
+            .dispatched_tools
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
 
         if state.iteration_count >= max_iterations {
             let _ = log::log(
@@ -1043,7 +1052,11 @@ impl ReactLoop {
         }
         // Snapshot in-flight mapping data before potential reset
         let request_id = state.request_id;
-        let call_ids: Vec<String> = state.dispatched_tools.iter().map(|t| t.id.clone()).collect();
+        let call_ids: Vec<String> = state
+            .dispatched_tools
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
 
         if state.check_phase_timeout()? {
             // Clean up KV correlation mappings that would otherwise leak
@@ -1083,7 +1096,7 @@ impl ReactLoop {
                             ),
                         );
                         serde_json::Value::Object(serde_json::Map::new())
-                    },
+                    }
                 };
 
                 dispatched.push(DispatchedToolCall {
@@ -1119,10 +1132,7 @@ impl ReactLoop {
                         arguments: tc.arguments.clone(),
                     },
                 ) {
-                    let _ = log::log(
-                        "error",
-                        format!("Failed to dispatch tool {}: {e}", tc.name),
-                    );
+                    let _ = log::log("error", format!("Failed to dispatch tool {}: {e}", tc.name));
                     delete_call_sessions(&call_ids);
                     let _ = ipc::publish_json(
                         "agent.v1.response",
@@ -1177,7 +1187,11 @@ impl ReactLoop {
         }
         // Clean call mappings if tools were dispatched
         if !state.dispatched_tools.is_empty() {
-            let call_ids: Vec<String> = state.dispatched_tools.iter().map(|t| t.id.clone()).collect();
+            let call_ids: Vec<String> = state
+                .dispatched_tools
+                .iter()
+                .map(|t| t.id.clone())
+                .collect();
             delete_call_sessions(&call_ids);
         }
     }
@@ -1196,8 +1210,11 @@ impl ReactLoop {
 
         // Notify tool capsules (host-level process tracker) before cleanup.
         if state.phase == Phase::AwaitingTools && !state.dispatched_tools.is_empty() {
-            let call_ids: Vec<String> =
-                state.dispatched_tools.iter().map(|t| t.id.clone()).collect();
+            let call_ids: Vec<String> = state
+                .dispatched_tools
+                .iter()
+                .map(|t| t.id.clone())
+                .collect();
             if let Err(e) = ipc::publish_json(
                 "tool.v1.request.cancel",
                 &IpcPayload::ToolCancelRequest { call_ids },
@@ -1214,8 +1231,7 @@ impl ReactLoop {
 
     /// Publish an LLM generation request to the provider capsule.
     fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
-        let model =
-            env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
 
         let tools = Self::load_tool_schemas();
         let llm_topic = Self::active_llm_topic();
@@ -1294,20 +1310,18 @@ impl ReactLoop {
                 "session_id": session_id,
             });
 
-            if let Some(msgs) = append_before_read {
-                if !msgs.is_empty() {
-                    request["append_before_read"] = serde_json::to_value(msgs).map_err(|e| {
-                        SysError::ApiError(format!("Failed to serialize append messages: {e}"))
-                    })?;
-                }
+            if let Some(msgs) = append_before_read
+                && !msgs.is_empty()
+            {
+                request["append_before_read"] = serde_json::to_value(msgs).map_err(|e| {
+                    SysError::ApiError(format!("Failed to serialize append messages: {e}"))
+                })?;
             }
 
             ipc::publish_json("session.v1.request.get_messages", &request)?;
 
             let response_bytes = ipc::recv_bytes(&handle, timeout).map_err(|e| {
-                SysError::ApiError(format!(
-                    "Session response timed out after {timeout}ms: {e}"
-                ))
+                SysError::ApiError(format!("Session response timed out after {timeout}ms: {e}"))
             })?;
 
             let envelope: serde_json::Value =
@@ -1343,7 +1357,7 @@ impl ReactLoop {
                             "Skipping IPC message with no payload.data (not Custom type)",
                         );
                         continue;
-                    },
+                    }
                 };
 
                 let messages: Vec<Message> = data
