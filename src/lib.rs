@@ -20,11 +20,11 @@
 //! flow that coordinates Session, Identity, Prompt Builder, Provider,
 //! and Tool Router capsules over the event bus.
 
-use astrid_events::ipc::IpcPayload;
-use astrid_events::llm::{
-    LlmToolDefinition, Message, MessageContent, MessageRole, StreamEvent, ToolCall, ToolCallResult,
-};
 use astrid_sdk::prelude::*;
+use astrid_sdk::types::{
+    IpcPayload, LlmToolDefinition, Message, MessageContent, MessageRole, StreamEvent, ToolCall,
+    ToolCallResult,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -366,7 +366,7 @@ impl TurnState {
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
         self.phase_entered_at_ms = time::now_ms().unwrap_or(0);
-        if phase == Phase::Idle {
+        if self.phase == Phase::Idle {
             unregister_active_session(&self.session_id);
         }
     }
@@ -537,8 +537,10 @@ impl ReactLoop {
         unregister_active_session(old_session_id);
 
         // Initialize a fresh turn state for the new session.
-        let mut new_state = TurnState::default();
-        new_state.session_id = new_session_id.clone();
+        let new_state = TurnState {
+            session_id: new_session_id.clone(),
+            ..TurnState::default()
+        };
         let key = turn_key(&new_session_id);
         kv::set_json(&key, &new_state)?;
 
@@ -618,10 +620,10 @@ impl ReactLoop {
 
         // Check for cancel signal before the empty-text guard, since
         // cancel is sent as empty text with context.action = "cancel_turn".
-        if let Some(ref ctx) = context {
-            if ctx.get("action").and_then(|v| v.as_str()) == Some("cancel_turn") {
-                return Self::handle_cancel(&session_id);
-            }
+        if let Some(ref ctx) = context
+            && ctx.get("action").and_then(|v| v.as_str()) == Some("cancel_turn")
+        {
+            return Self::handle_cancel(&session_id);
         }
 
         if text.trim().is_empty() {
@@ -1308,12 +1310,12 @@ impl ReactLoop {
                 "session_id": session_id,
             });
 
-            if let Some(msgs) = append_before_read {
-                if !msgs.is_empty() {
-                    request["append_before_read"] = serde_json::to_value(msgs).map_err(|e| {
-                        SysError::ApiError(format!("Failed to serialize append messages: {e}"))
-                    })?;
-                }
+            if let Some(msgs) = append_before_read
+                && !msgs.is_empty()
+            {
+                request["append_before_read"] = serde_json::to_value(msgs).map_err(|e| {
+                    SysError::ApiError(format!("Failed to serialize append messages: {e}"))
+                })?;
             }
 
             ipc::publish_json("session.v1.request.get_messages", &request)?;
