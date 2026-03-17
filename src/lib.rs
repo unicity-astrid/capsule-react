@@ -175,7 +175,7 @@ fn unregister_active_session(session_id: &str) {
 /// Read a `u64` config value from capsule config, with warning on parse failure.
 fn get_config_u64(key: &str, default: u64) -> u64 {
     match env::var(key) {
-        Ok(s) => match s.trim().trim_matches('"').parse::<u64>() {
+        Ok(s) if !s.trim().is_empty() => match s.trim().trim_matches('"').parse::<u64>() {
             Ok(v) => v,
             Err(e) => {
                 let _ = log::log(
@@ -187,7 +187,7 @@ fn get_config_u64(key: &str, default: u64) -> u64 {
                 default
             }
         },
-        Err(_) => default,
+        _ => default,
     }
 }
 
