@@ -74,7 +74,6 @@ requires = [
 ipc_publish = [
     "identity.v1.request.build",
     "prompt_builder.v1.assemble",
-    "agent.v1.stream.delta",
     "agent.v1.response",
     "agent.v1.session_changed",
     "tool.v1.request.execute",

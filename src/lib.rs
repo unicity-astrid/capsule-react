@@ -827,15 +827,6 @@ impl ReactLoop {
         match event {
             StreamEvent::TextDelta(text) => {
                 state.response_text.push_str(&text);
-                // Forward to platform for real-time display
-                let _ = ipc::publish_json(
-                    "agent.v1.stream.delta",
-                    &IpcPayload::AgentResponse {
-                        text,
-                        is_final: false,
-                        session_id: state.session_id.clone(),
-                    },
-                );
             }
             StreamEvent::ToolCallStart { id, name } => {
                 state.pending_stream_tools.push(PendingToolCall {
