@@ -1387,14 +1387,24 @@ impl ReactLoop {
 
     /// Resolve the active LLM provider topic from the registry.
     fn active_llm_topic() -> String {
-        kv::get_bytes("llm_provider_topic")
+        let topic = kv::get_bytes("llm_provider_topic")
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
                 env::var("llm_provider_topic")
                     .unwrap_or_else(|_| "llm.v1.request.generate.anthropic".into())
-            })
+            });
+
+        // Validate: reject topics with empty segments
+        if topic.is_empty()
+            || topic.ends_with('.')
+            || topic.starts_with('.')
+            || topic.contains("..")
+        {
+            return "llm.v1.request.generate.anthropic".into();
+        }
+        topic
     }
 
     /// Load tool schemas from KV.
