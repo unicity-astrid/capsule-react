@@ -58,6 +58,14 @@ const ACTIVE_SESSIONS_KEY: &str = "react.active_sessions";
 /// Default timeout in milliseconds for session capsule requests.
 const DEFAULT_SESSION_TIMEOUT_MS: u64 = 2_000;
 
+/// Current wall-clock time as milliseconds since UNIX epoch, or 0 if unavailable.
+fn now_ms() -> u64 {
+    time::now()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// Build the KV key for a session's turn state.
 fn turn_key(session_id: &str) -> String {
     format!("{TURN_KEY_PREFIX}.{session_id}")
@@ -365,7 +373,7 @@ impl TurnState {
     /// from the active sessions set so the watchdog stops checking it.
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
-        self.phase_entered_at_ms = time::now_ms().unwrap_or(0);
+        self.phase_entered_at_ms = now_ms();
         if self.phase == Phase::Idle {
             unregister_active_session(&self.session_id);
         }
@@ -380,7 +388,7 @@ impl TurnState {
         if self.phase == Phase::Idle {
             return Ok(false);
         }
-        let now = time::now_ms().unwrap_or(0);
+        let now = now_ms();
         if now == 0 || self.phase_entered_at_ms == 0 {
             let _ = log::log(
                 "warn",
