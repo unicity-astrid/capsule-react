@@ -62,6 +62,9 @@ action = "handle_session_clear"
 
 [dependencies]
 requires = [
+    "rfc:llm-provider.v1",
+    "rfc:session-protocol.v1",
+    "rfc:identity.v1",
     "topic:identity.v1.response.ready",
     "topic:session.v1.response.get_messages",
 ]
