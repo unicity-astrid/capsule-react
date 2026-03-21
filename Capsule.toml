@@ -17,7 +17,7 @@ action = "handle_user_prompt"
 
 # System prompt returned by the identity capsule
 [[interceptor]]
-event = "identity.v1.response.ready"
+event = "spark.v1.response.ready"
 action = "handle_identity_response"
 
 # Assembled prompt returned by the prompt builder capsule
@@ -71,7 +71,7 @@ spark = "^1.0"
 
 [capabilities]
 ipc_publish = [
-    "identity.v1.request.build",
+    "spark.v1.request.build",
     "prompt_builder.v1.assemble",
     "agent.v1.response",
     "agent.v1.session_changed",

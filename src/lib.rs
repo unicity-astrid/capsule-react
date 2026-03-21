@@ -673,7 +673,7 @@ impl ReactLoop {
         // Request system prompt from the identity capsule.
         // session_id is threaded through so the response echoes it back.
         ipc::publish_json(
-            "identity.v1.request.build",
+            "spark.v1.request.build",
             &serde_json::json!({
                 "workspace_root": env::var("workspace_root").unwrap_or_default(),
                 "session_id": state.session_id,
@@ -683,7 +683,7 @@ impl ReactLoop {
         Ok(())
     }
 
-    /// Handles `identity.v1.response.ready` events from the identity capsule.
+    /// Handles `spark.v1.response.ready` events from the identity capsule.
     ///
     /// Receives the assembled system prompt and sends it to the prompt
     /// builder capsule for capsule hook interception before LLM generation.
