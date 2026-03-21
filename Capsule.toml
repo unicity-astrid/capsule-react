@@ -60,11 +60,10 @@ action = "handle_lifecycle_restart"
 event = "session.v1.clear"
 action = "handle_session_clear"
 
-[dependencies]
-requires = [
-    "topic:identity.v1.response.ready",
-    "topic:session.v1.response.get_messages",
-]
+[imports.astrid]
+llm = "^1.0"
+session = "^1.0"
+spark = "^1.0"
 
 # Guest-initiated subscriptions (ACL-gated via ipc_subscribe below):
 #   session.v1.response.get_messages.<correlation_id>  <- covered by session.v1.response.get_messages.*
