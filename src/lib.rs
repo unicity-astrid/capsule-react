@@ -783,45 +783,10 @@ impl ReactLoop {
             state.system_prompt = prompt.to_string();
         }
 
-        // Parse tools from the prompt builder response.
-        let tools: Vec<LlmToolDefinition> = payload
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        serde_json::from_value::<LlmToolDefinition>(v.clone())
-                            .map_err(|e| {
-                                let _ = log::warn(format!(
-                                    "Failed to parse tool schema from prompt builder: {e}"
-                                ));
-                                e
-                            })
-                            .ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Parse messages from the prompt builder response.
-        let mut messages: Vec<Message> = payload
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        serde_json::from_value::<Message>(v.clone())
-                            .map_err(|e| {
-                                let _ = log::warn(format!(
-                                    "Failed to parse message from prompt builder: {e}"
-                                ));
-                                e
-                            })
-                            .ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Parse tools and messages from the prompt builder response.
+        let tools: Vec<LlmToolDefinition> =
+            parse_json_array_field(&payload, "tools", "tool schema");
+        let mut messages: Vec<Message> = parse_json_array_field(&payload, "messages", "message");
 
         // Apply user context prefix to the LOCAL COPY ONLY.
         // Session's copy stays clean - this is an ephemeral transform.
@@ -1443,4 +1408,33 @@ impl ReactLoop {
                     .unwrap_or_else(|_| "llm.v1.request.generate.anthropic".into())
             })
     }
+}
+
+/// Parse a JSON array field from a payload, deserializing each element.
+///
+/// Logs a warning for each element that fails to deserialize and skips it.
+/// Returns an empty vec if the field is missing or not an array.
+fn parse_json_array_field<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> Vec<T> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    serde_json::from_value::<T>(v.clone())
+                        .map_err(|e| {
+                            let _ = log::warn(format!(
+                                "Failed to parse {label} from prompt builder: {e}"
+                            ));
+                            e
+                        })
+                        .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
