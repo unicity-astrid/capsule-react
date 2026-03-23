@@ -286,6 +286,11 @@ pub(crate) struct TurnState {
     pending_stream_tools: Vec<PendingToolCall>,
     /// Tool calls that have been dispatched for execution.
     dispatched_tools: Vec<DispatchedToolCall>,
+    /// Tool schemas for the current turn, provided by the prompt builder.
+    /// Persisted across tool iterations so the same tool set is used for
+    /// continuation requests after tool results arrive.
+    #[serde(default)]
+    current_tools: Vec<LlmToolDefinition>,
     /// Number of Streaming -> AwaitingTools -> Streaming iterations this turn.
     #[serde(default)]
     iteration_count: u32,
@@ -305,6 +310,7 @@ impl Default for TurnState {
             response_text: String::new(),
             pending_stream_tools: Vec::new(),
             dispatched_tools: Vec::new(),
+            current_tools: Vec::new(),
             iteration_count: 0,
             phase_entered_at_ms: 0,
         }
@@ -364,6 +370,7 @@ impl TurnState {
     /// Fully reset turn state for a new conversation turn (new user prompt).
     fn reset_conversation_turn(&mut self) {
         self.reset_turn();
+        self.current_tools.clear();
         self.iteration_count = 0;
     }
 
@@ -776,8 +783,10 @@ impl ReactLoop {
             state.system_prompt = prompt.to_string();
         }
 
-        // Fetch messages from session for prompt assembly.
-        let mut messages = Self::fetch_messages(&state.session_id)?;
+        // Parse tools and messages from the prompt builder response.
+        let tools: Vec<LlmToolDefinition> =
+            parse_json_array_field(&payload, "tools", "tool schema");
+        let mut messages: Vec<Message> = parse_json_array_field(&payload, "messages", "message");
 
         // Apply user context prefix to the LOCAL COPY ONLY.
         // Session's copy stays clean - this is an ephemeral transform.
@@ -792,6 +801,8 @@ impl ReactLoop {
             *text = format!("{prefix}\n{text}");
         }
 
+        // Store tools in turn state for reuse in tool result iterations.
+        state.current_tools = tools;
         state.set_phase(Phase::Streaming);
         state.save()?;
 
@@ -1229,10 +1240,12 @@ impl ReactLoop {
     }
 
     /// Publish an LLM generation request to the provider capsule.
+    ///
+    /// Tools and messages are provided by the caller — either from the prompt
+    /// builder response (initial request) or from turn state (tool iterations).
     fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
         let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
 
-        let tools = Self::load_tool_schemas();
         let llm_topic = Self::active_llm_topic();
 
         // Store request_id -> session_id mapping so handle_llm_stream
@@ -1245,7 +1258,7 @@ impl ReactLoop {
                 request_id: state.request_id,
                 model,
                 messages: messages.to_vec(),
-                tools,
+                tools: state.current_tools.clone(),
                 system: state.system_prompt.clone(),
             },
         ) {
@@ -1395,9 +1408,33 @@ impl ReactLoop {
                     .unwrap_or_else(|_| "llm.v1.request.generate.anthropic".into())
             })
     }
+}
 
-    /// Load tool schemas from KV.
-    fn load_tool_schemas() -> Vec<LlmToolDefinition> {
-        kv::get_json::<Vec<LlmToolDefinition>>("tool_schemas").unwrap_or_default()
-    }
+/// Parse a JSON array field from a payload, deserializing each element.
+///
+/// Logs a warning for each element that fails to deserialize and skips it.
+/// Returns an empty vec if the field is missing or not an array.
+fn parse_json_array_field<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> Vec<T> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    serde_json::from_value::<T>(v.clone())
+                        .map_err(|e| {
+                            let _ = log::warn(format!(
+                                "Failed to parse {label} from prompt builder: {e}"
+                            ));
+                            e
+                        })
+                        .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
