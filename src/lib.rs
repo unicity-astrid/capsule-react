@@ -58,6 +58,26 @@ const ACTIVE_SESSIONS_KEY: &str = "react.active_sessions";
 /// Default timeout in milliseconds for session capsule requests.
 const DEFAULT_SESSION_TIMEOUT_MS: u64 = 2_000;
 
+/// Default timeout in milliseconds for context engine compact requests.
+const DEFAULT_COMPACT_TIMEOUT_MS: u64 = 5_000;
+
+/// KV key for cached provider context window size (tokens).
+const KV_CONTEXT_WINDOW: &str = "react.context_window";
+
+/// KV key for cached provider max output tokens.
+const KV_MAX_OUTPUT_TOKENS: &str = "react.max_output_tokens";
+
+/// IPC topic for context engine compact requests.
+const COMPACT_REQUEST_TOPIC: &str = "context_engine.v1.compact";
+
+/// IPC topic for context engine compact responses.
+const COMPACT_RESPONSE_TOPIC: &str = "context_engine.v1.response.compact";
+
+/// Fraction of context budget used as the compaction target (90%).
+/// Leaves headroom for system prompt and tool schemas.
+const COMPACTION_TARGET_NUM: u64 = 9;
+const COMPACTION_TARGET_DENOM: u64 = 10;
+
 /// Current wall-clock time as milliseconds since UNIX epoch, or 0 if unavailable.
 fn now_ms() -> u64 {
     time::now()
@@ -1031,6 +1051,7 @@ impl ReactLoop {
     /// Stores the new provider topic in KV so subsequent LLM requests
     /// route to the correct provider. Validates that the topic follows
     /// the expected `llm.request.generate.*` pattern as defense-in-depth.
+    /// Caches context window limits from the provider metadata.
     #[astrid::interceptor("handle_model_changed")]
     pub fn handle_model_changed(&self, payload: serde_json::Value) -> Result<(), SysError> {
         if let Some(topic) = payload.get("request_topic").and_then(|t| t.as_str()) {
@@ -1042,6 +1063,25 @@ impl ReactLoop {
                 return Ok(());
             }
             kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
+
+            // Cache context window limits from the provider metadata.
+            for (kv_key, payload_key, log_on_set) in [
+                (KV_CONTEXT_WINDOW, "context_window", true),
+                (KV_MAX_OUTPUT_TOKENS, "max_output_tokens", false),
+            ] {
+                let value = payload
+                    .get(payload_key)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
+                    let _ = log::log("error", format!("Failed to cache {payload_key}: {e}"));
+                } else if log_on_set && value > 0 {
+                    let _ = log::log(
+                        "info",
+                        format!("Cached provider {payload_key}: {value} tokens"),
+                    );
+                }
+            }
         } else {
             let _ = log::log(
                 "warn",
@@ -1243,10 +1283,15 @@ impl ReactLoop {
     ///
     /// Tools and messages are provided by the caller — either from the prompt
     /// builder response (initial request) or from turn state (tool iterations).
+    /// Messages are compacted via the context engine if a context window budget
+    /// is available.
     fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
         let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
 
         let llm_topic = Self::active_llm_topic();
+
+        // Compact messages to fit within the provider's context window.
+        let messages = Self::compact_messages(&state.session_id, messages.to_vec());
 
         // Store request_id -> session_id mapping so handle_llm_stream
         // can resolve the owning session from the stream's request_id.
@@ -1257,7 +1302,7 @@ impl ReactLoop {
             &IpcPayload::LlmRequest {
                 request_id: state.request_id,
                 model,
-                messages: messages.to_vec(),
+                messages,
                 tools: state.current_tools.clone(),
                 system: state.system_prompt.clone(),
             },
@@ -1407,6 +1452,111 @@ impl ReactLoop {
                 env::var("llm_provider_topic")
                     .unwrap_or_else(|_| "llm.v1.request.generate.anthropic".into())
             })
+    }
+
+    /// Read cached context window from KV. Returns `None` if not yet queried.
+    fn cached_context_window() -> Option<u64> {
+        kv::get_bytes(KV_CONTEXT_WINDOW)
+            .ok()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .filter(|&v| v > 0)
+    }
+
+    /// Read cached max output tokens from KV.
+    fn cached_max_output_tokens() -> u64 {
+        kv::get_bytes(KV_MAX_OUTPUT_TOKENS)
+            .ok()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Compact messages via the context engine if a context window budget is known.
+    ///
+    /// If no limits are cached (provider hasn't been queried yet), returns
+    /// messages unchanged — matching the previous no-compaction behavior.
+    fn compact_messages(session_id: &str, messages: Vec<Message>) -> Vec<Message> {
+        let context_window = match Self::cached_context_window() {
+            Some(cw) => cw,
+            None => return messages,
+        };
+
+        let max_output = Self::cached_max_output_tokens();
+
+        // Budget: total context minus output reservation.
+        // Use 90% of the remaining budget as the target to leave headroom
+        // for system prompt and tool schemas (estimated separately by the
+        // provider, not included in the message token count).
+        let max_tokens = context_window.saturating_sub(max_output);
+        let target_tokens = max_tokens * COMPACTION_TARGET_NUM / COMPACTION_TARGET_DENOM;
+
+        if max_tokens == 0 {
+            return messages;
+        }
+
+        let response_topic = COMPACT_RESPONSE_TOPIC;
+        let handle = match ipc::subscribe(response_topic) {
+            Ok(h) => h,
+            Err(_) => return messages,
+        };
+
+        let result = (|| -> Option<Vec<Message>> {
+            let msg_values: Vec<serde_json::Value> = messages
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect();
+
+            let request = serde_json::json!({
+                "session_id": session_id,
+                "messages": msg_values,
+                "max_tokens": max_tokens,
+                "target_tokens": target_tokens,
+            });
+
+            if ipc::publish_json(COMPACT_REQUEST_TOPIC, &request).is_err() {
+                return None;
+            }
+
+            let response_bytes = ipc::recv_bytes(&handle, DEFAULT_COMPACT_TIMEOUT_MS).ok()?;
+            let envelope: serde_json::Value = serde_json::from_slice(&response_bytes).ok()?;
+
+            // Navigate IPC drain envelope: messages[0].payload.data
+            let data = envelope
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|msg| msg.get("payload"))
+                .and_then(|p| p.get("data"))?;
+
+            let compacted_msgs: Vec<serde_json::Value> =
+                serde_json::from_value(data.get("messages")?.clone()).ok()?;
+
+            let result: Vec<Message> = compacted_msgs
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
+
+            if let Some(true) = data.get("compacted").and_then(|v| v.as_bool()) {
+                let removed = data
+                    .get("messages_removed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let _ = log::log(
+                    "info",
+                    format!(
+                        "Context compaction: removed {removed} messages \
+                         (budget: {max_tokens} tokens, target: {target_tokens})"
+                    ),
+                );
+            }
+
+            Some(result)
+        })();
+
+        let _ = ipc::unsubscribe(&handle);
+
+        result.unwrap_or(messages)
     }
 }
 
