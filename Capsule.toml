@@ -64,6 +64,7 @@ action = "handle_session_clear"
 llm = "^1.0"
 session = "^1.0"
 spark = "^1.0"
+context = "^1.0"
 
 # Guest-initiated subscriptions (ACL-gated via ipc_subscribe below):
 #   session.v1.response.get_messages.<correlation_id>  <- covered by session.v1.response.get_messages.*
@@ -78,10 +79,12 @@ ipc_publish = [
     "tool.v1.request.execute",
     "tool.v1.request.cancel",
     "llm.v1.request.generate.*",
+    "context_engine.v1.compact",
     "session.v1.request.get_messages",
     "session.v1.request.clear",
 ]
 ipc_subscribe = [
     "session.v1.response.get_messages.*",
     "session.v1.response.clear.*",
+    "context_engine.v1.response.compact",
 ]
