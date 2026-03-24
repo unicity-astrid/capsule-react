@@ -863,6 +863,12 @@ impl ReactLoop {
             return Ok(());
         }
 
+        // Reset the phase timer on each streaming event so the timeout
+        // measures "time since last token" not "time since stream start".
+        // Prevents slow models (local inference) from timing out while
+        // actively streaming.
+        state.phase_entered_at_ms = now_ms();
+
         match event {
             StreamEvent::TextDelta(text) => {
                 state.response_text.push_str(&text);
