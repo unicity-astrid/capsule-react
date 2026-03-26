@@ -128,7 +128,7 @@ fn lookup_session_by_call(call_id: &str) -> Option<String> {
 fn delete_request_session(request_id: &Uuid) {
     let key = format!("{REQUEST_SESSION_PREFIX}.{request_id}");
     if let Err(e) = kv::delete(&key) {
-        let _ = log::warn(format!("Failed to delete req2sess key '{key}': {e}"));
+        log::warn(format!("Failed to delete req2sess key '{key}': {e}"));
     }
 }
 
@@ -137,7 +137,7 @@ fn delete_call_sessions(call_ids: &[String]) {
     for call_id in call_ids {
         let key = format!("{CALL_SESSION_PREFIX}.{call_id}");
         if let Err(e) = kv::delete(&key) {
-            let _ = log::warn(format!("Failed to delete call2sess key '{key}': {e}"));
+            log::warn(format!("Failed to delete call2sess key '{key}': {e}"));
         }
     }
 }
@@ -145,7 +145,7 @@ fn delete_call_sessions(call_ids: &[String]) {
 /// Load the set of active session IDs from KV.
 fn load_active_sessions() -> Vec<String> {
     kv::get_json::<Vec<String>>(ACTIVE_SESSIONS_KEY).unwrap_or_else(|e| {
-        let _ = log::warn(format!(
+        log::warn(format!(
             "Failed to load active sessions from KV, defaulting to empty: {e}"
         ));
         Vec::new()
@@ -158,7 +158,7 @@ fn register_active_session(session_id: &str) {
     if !sessions.iter().any(|s| s == session_id) {
         sessions.push(session_id.to_string());
         if let Err(e) = kv::set_json(ACTIVE_SESSIONS_KEY, &sessions) {
-            let _ = log::error(format!(
+            log::error(format!(
                 "Failed to register active session '{session_id}': {e}"
             ));
         }
@@ -173,16 +173,16 @@ fn clear_ephemeral_keys() {
     for prefix in ["react.turn.", "react.req2sess.", "react.call2sess."] {
         match kv::clear_prefix(prefix) {
             Ok(n) if n > 0 => {
-                let _ = log::info(format!("Cleared {n} ephemeral keys with prefix '{prefix}'"));
+                log::info(format!("Cleared {n} ephemeral keys with prefix '{prefix}'"));
             }
             Err(e) => {
-                let _ = log::warn(format!("Failed to clear ephemeral keys '{prefix}': {e}"));
+                log::warn(format!("Failed to clear ephemeral keys '{prefix}': {e}"));
             }
             _ => {}
         }
     }
     if let Err(e) = kv::delete(ACTIVE_SESSIONS_KEY) {
-        let _ = log::warn(format!("Failed to clear active sessions key: {e}"));
+        log::warn(format!("Failed to clear active sessions key: {e}"));
     }
 }
 
@@ -192,10 +192,9 @@ fn unregister_active_session(session_id: &str) {
     if let Some(pos) = sessions.iter().position(|s| s == session_id) {
         sessions.swap_remove(pos);
         if let Err(e) = kv::set_json(ACTIVE_SESSIONS_KEY, &sessions) {
-            let _ = log::log(
-                "error",
-                format!("Failed to unregister active session '{session_id}': {e}"),
-            );
+            log::error(format!(
+                "Failed to unregister active session '{session_id}': {e}"
+            ));
         }
     }
 }
@@ -206,12 +205,9 @@ fn get_config_u64(key: &str, default: u64) -> u64 {
         Ok(s) if !s.trim().is_empty() => match s.trim().trim_matches('"').parse::<u64>() {
             Ok(v) => v,
             Err(e) => {
-                let _ = log::log(
-                    "warn",
-                    format!(
-                        "Invalid config for '{key}': \"{s}\", using default {default}. Error: {e}"
-                    ),
-                );
+                log::warn(format!(
+                    "Invalid config for '{key}': \"{s}\", using default {default}. Error: {e}"
+                ));
                 default
             }
         },
@@ -346,21 +342,15 @@ impl TurnState {
     fn load(session_id: &str) -> Self {
         let key = turn_key(session_id);
         let mut state = kv::get_json::<Self>(&key).unwrap_or_else(|e| {
-            let _ = log::log(
-                "error",
-                format!("Failed to load turn state, resetting: {e}"),
-            );
+            log::error(format!("Failed to load turn state, resetting: {e}"));
             Self::default()
         });
 
         if !matches!(state.schema_version, 0 | 1) {
-            let _ = log::log(
-                "warn",
-                format!(
-                    "TurnState has unknown schema version {}, resetting to default",
-                    state.schema_version
-                ),
-            );
+            log::warn(format!(
+                "TurnState has unknown schema version {}, resetting to default",
+                state.schema_version
+            ));
             state = Self::default();
         }
 
@@ -417,8 +407,7 @@ impl TurnState {
         }
         let now = now_ms();
         if now == 0 || self.phase_entered_at_ms == 0 {
-            let _ = log::log(
-                "warn",
+            log::warn(
                 "clock_ms unavailable or phase timestamp missing - phase timeouts disabled for this check",
             );
             return Ok(false);
@@ -437,10 +426,9 @@ impl TurnState {
 
         if elapsed_secs >= timeout {
             let phase_name = format!("{:?}", self.phase);
-            let _ = log::log(
-                "error",
-                format!("Phase {phase_name} timed out after {elapsed_secs}s"),
-            );
+            log::error(format!(
+                "Phase {phase_name} timed out after {elapsed_secs}s"
+            ));
             let _ = ipc::publish_json(
                 "agent.v1.response",
                 &IpcPayload::AgentResponse {
@@ -477,7 +465,7 @@ impl ReactLoop {
     /// to attempt `serde_json::from_slice(&[])`, which always fails.
     #[astrid::interceptor("handle_lifecycle_restart")]
     pub fn handle_lifecycle_restart(&self) -> Result<(), SysError> {
-        let _ = log::info("Lifecycle restart: clearing ephemeral keys");
+        log::info("Lifecycle restart: clearing ephemeral keys");
         clear_ephemeral_keys();
         Ok(())
     }
@@ -512,32 +500,25 @@ impl ReactLoop {
                 }),
             )?;
 
-            let response_bytes = ipc::recv_bytes(&handle, timeout).map_err(|e| {
+            let poll_result = ipc::recv(&handle, timeout).map_err(|e| {
                 SysError::ApiError(format!("Session clear timed out after {timeout}ms: {e}"))
             })?;
 
-            let envelope: serde_json::Value =
-                serde_json::from_slice(&response_bytes).map_err(|e| {
-                    SysError::ApiError(format!("Failed to parse session clear response: {e}"))
-                })?;
-
-            let ipc_messages = envelope
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .ok_or_else(|| {
-                    SysError::ApiError("Session clear response has no messages array".into())
-                })?;
-
-            if ipc_messages.is_empty() {
+            if poll_result.messages.is_empty() {
                 return Err(SysError::ApiError(format!(
                     "Session clear timed out after {timeout}ms: no messages in response"
                 )));
             }
 
             // The topic is scoped to this request, so no correlation_id check
-            // is needed. Iterate to skip non-Custom messages (no payload.data).
-            for msg in ipc_messages {
-                let data = match msg.get("payload").and_then(|p| p.get("data")) {
+            // is needed. Iterate to skip messages with unparseable payloads.
+            for msg in &poll_result.messages {
+                let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let data = match payload.get("data") {
                     Some(d) => d,
                     None => continue,
                 };
@@ -565,7 +546,7 @@ impl ReactLoop {
         // Delete the old session's turn state - the session is done.
         let old_key = turn_key(old_session_id);
         if let Err(e) = kv::delete(&old_key) {
-            let _ = log::warn(format!(
+            log::warn(format!(
                 "Failed to delete old turn state key '{old_key}': {e}"
             ));
         }
@@ -579,10 +560,9 @@ impl ReactLoop {
         let key = turn_key(&new_session_id);
         kv::set_json(&key, &new_state)?;
 
-        let _ = log::log(
-            "info",
-            format!("Session cleared: '{old_session_id}' -> '{new_session_id}'"),
-        );
+        log::info(format!(
+            "Session cleared: '{old_session_id}' -> '{new_session_id}'"
+        ));
 
         // Notify frontends of the session change.
         ipc::publish_json(
@@ -605,10 +585,9 @@ impl ReactLoop {
         for session_id in load_active_sessions() {
             let mut state = TurnState::load(&session_id);
             if let Err(e) = Self::check_timeout_with_cleanup(&mut state) {
-                let _ = log::log(
-                    "error",
-                    format!("Watchdog timeout check failed for session '{session_id}': {e}"),
-                );
+                log::error(format!(
+                    "Watchdog timeout check failed for session '{session_id}': {e}"
+                ));
             }
         }
         Ok(())
@@ -627,12 +606,9 @@ impl ReactLoop {
         for session_id in load_active_sessions() {
             let state = TurnState::load(&session_id);
             if state.phase == Phase::AwaitingTools {
-                let _ = log::log(
-                    "warn",
-                    format!(
-                        "Event bus lagged while session '{session_id}' awaits tool results - watchdog will recover if results were lost"
-                    ),
-                );
+                log::warn(format!(
+                    "Event bus lagged while session '{session_id}' awaits tool results - watchdog will recover if results were lost"
+                ));
             }
         }
         Ok(())
@@ -668,8 +644,7 @@ impl ReactLoop {
         // Warn when using the default session ID - may indicate an
         // unpatched frontend that doesn't send session_id yet.
         if session_id == DEFAULT_SESSION_ID {
-            let _ = log::log(
-                "warn",
+            log::warn(
                 "UserInput using default session_id - frontend may not be sending session_id",
             );
         }
@@ -895,7 +870,7 @@ impl ReactLoop {
                 return Self::handle_stream_done(&mut state);
             }
             StreamEvent::Error(err) => {
-                let _ = log::error(format!("LLM stream error: {err}"));
+                log::error(format!("LLM stream error: {err}"));
                 let _ = ipc::publish_json(
                     "agent.v1.response",
                     &IpcPayload::AgentResponse {
@@ -953,13 +928,10 @@ impl ReactLoop {
         // Verify turn_request_id matches to reject stale results from a previous turn.
         if let Some(tc) = state.dispatched_tools.iter_mut().find(|t| t.id == call_id) {
             if !tc.turn_request_id.is_nil() && tc.turn_request_id != state.request_id {
-                let _ = log::log(
-                    "warn",
-                    format!(
-                        "Dropping stale tool result for {}: turn_request_id mismatch",
-                        call_id
-                    ),
-                );
+                log::warn(format!(
+                    "Dropping stale tool result for {}: turn_request_id mismatch",
+                    call_id
+                ));
                 return Ok(());
             }
             tc.result = Some(result);
@@ -993,10 +965,9 @@ impl ReactLoop {
             .collect();
 
         if state.iteration_count >= max_iterations {
-            let _ = log::log(
-                "error",
-                format!("ReAct loop exceeded {max_iterations} iterations, forcing stop"),
-            );
+            log::error(format!(
+                "ReAct loop exceeded {max_iterations} iterations, forcing stop"
+            ));
             let _ = ipc::publish_json(
                 "agent.v1.response",
                 &IpcPayload::AgentResponse {
@@ -1062,10 +1033,7 @@ impl ReactLoop {
     pub fn handle_model_changed(&self, payload: serde_json::Value) -> Result<(), SysError> {
         if let Some(topic) = payload.get("request_topic").and_then(|t| t.as_str()) {
             if !topic.starts_with("llm.v1.request.generate.") {
-                let _ = log::log(
-                    "warn",
-                    format!("Rejected model change with invalid topic: {topic}"),
-                );
+                log::warn(format!("Rejected model change with invalid topic: {topic}"));
                 return Ok(());
             }
             kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
@@ -1080,19 +1048,13 @@ impl ReactLoop {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
-                    let _ = log::log("error", format!("Failed to cache {payload_key}: {e}"));
+                    log::error(format!("Failed to cache {payload_key}: {e}"));
                 } else if log_on_set && value > 0 {
-                    let _ = log::log(
-                        "info",
-                        format!("Cached provider {payload_key}: {value} tokens"),
-                    );
+                    log::info(format!("Cached provider {payload_key}: {value} tokens"));
                 }
             }
         } else {
-            let _ = log::log(
-                "warn",
-                "handle_model_changed: payload missing 'request_topic', ignoring",
-            );
+            log::warn("handle_model_changed: payload missing 'request_topic', ignoring");
         }
         Ok(())
     }
@@ -1144,13 +1106,10 @@ impl ReactLoop {
                 let arguments: serde_json::Value = match serde_json::from_str(&tc.args_json) {
                     Ok(args) => args,
                     Err(e) => {
-                        let _ = log::log(
-                            "warn",
-                            format!(
-                                "Failed to parse tool arguments for {}: {e}. Defaulting to empty object.",
-                                tc.name
-                            ),
-                        );
+                        log::warn(format!(
+                            "Failed to parse tool arguments for {}: {e}. Defaulting to empty object.",
+                            tc.name
+                        ));
                         serde_json::Value::Object(serde_json::Map::new())
                     }
                 };
@@ -1188,7 +1147,7 @@ impl ReactLoop {
                         arguments: tc.arguments.clone(),
                     },
                 ) {
-                    let _ = log::log("error", format!("Failed to dispatch tool {}: {e}", tc.name));
+                    log::error(format!("Failed to dispatch tool {}: {e}", tc.name));
                     delete_call_sessions(&call_ids);
                     let _ = ipc::publish_json(
                         "agent.v1.response",
@@ -1262,7 +1221,7 @@ impl ReactLoop {
         if state.phase == Phase::Idle {
             return Ok(());
         }
-        let _ = log::info(format!("Cancelling turn for session {session_id}"));
+        log::info(format!("Cancelling turn for session {session_id}"));
 
         // Notify tool capsules (host-level process tracker) before cleanup.
         if state.phase == Phase::AwaitingTools && !state.dispatched_tools.is_empty() {
@@ -1275,7 +1234,7 @@ impl ReactLoop {
                 "tool.v1.request.cancel",
                 &IpcPayload::ToolCancelRequest { call_ids },
             ) {
-                let _ = log::warn(format!("Failed to publish tool cancel event: {e}"));
+                log::warn(format!("Failed to publish tool cancel event: {e}"));
             }
         }
 
@@ -1383,42 +1342,32 @@ impl ReactLoop {
 
             ipc::publish_json("session.v1.request.get_messages", &request)?;
 
-            let response_bytes = ipc::recv_bytes(&handle, timeout).map_err(|e| {
+            let poll_result = ipc::recv(&handle, timeout).map_err(|e| {
                 SysError::ApiError(format!("Session response timed out after {timeout}ms: {e}"))
             })?;
 
-            let envelope: serde_json::Value =
-                serde_json::from_slice(&response_bytes).map_err(|e| {
-                    SysError::ApiError(format!("Failed to parse session response: {e}"))
-                })?;
-
-            // Navigate the IPC drain envelope to find the session response.
-            // Path: envelope.messages[0].payload.data.{messages}
-            let ipc_messages = envelope
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .ok_or_else(|| {
-                    SysError::ApiError("Session response envelope has no messages array".into())
-                })?;
-
-            // Empty envelope means the subscription timed out with no response.
-            // The host returns Ok({"messages":[],...}) on timeout, not an error.
-            if ipc_messages.is_empty() {
+            // Empty result means the subscription timed out with no response.
+            if poll_result.messages.is_empty() {
                 return Err(SysError::ApiError(format!(
                     "Session capsule timed out - no response within {timeout}ms"
                 )));
             }
 
             // The topic is scoped to this request, so no correlation_id check
-            // is needed. Iterate to skip non-Custom messages (no payload.data).
-            for msg in ipc_messages {
-                let data = match msg.get("payload").and_then(|p| p.get("data")) {
+            // is needed. Iterate to skip messages with unparseable payloads.
+            for msg in &poll_result.messages {
+                let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        log::debug("Skipping IPC message with unparseable payload");
+                        continue;
+                    }
+                };
+
+                let data = match payload.get("data") {
                     Some(d) => d,
                     None => {
-                        let _ = log::log(
-                            "debug",
-                            "Skipping IPC message with no payload.data (not Custom type)",
-                        );
+                        log::debug("Skipping IPC message with no data field");
                         continue;
                     }
                 };
@@ -1524,16 +1473,12 @@ impl ReactLoop {
                 return None;
             }
 
-            let response_bytes = ipc::recv_bytes(&handle, DEFAULT_COMPACT_TIMEOUT_MS).ok()?;
-            let envelope: serde_json::Value = serde_json::from_slice(&response_bytes).ok()?;
+            let poll_result = ipc::recv(&handle, DEFAULT_COMPACT_TIMEOUT_MS).ok()?;
 
-            // Navigate IPC drain envelope: messages[0].payload.data
-            let data = envelope
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|msg| msg.get("payload"))
-                .and_then(|p| p.get("data"))?;
+            // Navigate PollResult: first message's payload -> data
+            let first_msg = poll_result.messages.first()?;
+            let payload: serde_json::Value = serde_json::from_str(&first_msg.payload).ok()?;
+            let data = payload.get("data")?;
 
             let compacted_msgs: Vec<serde_json::Value> =
                 serde_json::from_value(data.get("messages")?.clone()).ok()?;
@@ -1548,13 +1493,10 @@ impl ReactLoop {
                     .get("messages_removed")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let _ = log::log(
-                    "info",
-                    format!(
-                        "Context compaction: removed {removed} messages \
+                log::info(format!(
+                    "Context compaction: removed {removed} messages \
                          (budget: {max_tokens} tokens, target: {target_tokens})"
-                    ),
-                );
+                ));
             }
 
             Some(result)
@@ -1583,9 +1525,7 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
                 .filter_map(|v| {
                     serde_json::from_value::<T>(v.clone())
                         .map_err(|e| {
-                            let _ = log::warn(format!(
-                                "Failed to parse {label} from prompt builder: {e}"
-                            ));
+                            log::warn(format!("Failed to parse {label} from prompt builder: {e}"));
                             e
                         })
                         .ok()
