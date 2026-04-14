@@ -88,3 +88,53 @@ ipc_subscribe = [
     "session.v1.response.clear.*",
     "context_engine.v1.response.compact",
 ]
+
+[[topic]]
+name = "spark.v1.request.build"
+direction = "publish"
+description = "Request the identity capsule to build the system prompt"
+
+[[topic]]
+name = "prompt_builder.v1.assemble"
+direction = "publish"
+description = "Request the prompt builder to assemble the final prompt"
+
+[[topic]]
+name = "agent.v1.response"
+direction = "publish"
+description = "Final or error response sent to frontends"
+
+[[topic]]
+name = "agent.v1.session_changed"
+direction = "publish"
+description = "Notification when the active session ID changes"
+
+[[topic]]
+name = "tool.v1.request.execute"
+direction = "publish"
+description = "Request the tool router to execute a tool call"
+
+[[topic]]
+name = "tool.v1.request.cancel"
+direction = "publish"
+description = "Request the tool router to cancel in-flight tool calls"
+
+[[topic]]
+name = "llm.v1.request.generate.*"
+direction = "publish"
+description = "LLM generation request routed to the active provider capsule"
+
+[[topic]]
+name = "context_engine.v1.compact"
+direction = "publish"
+description = "Request the context engine to compact messages within a token budget"
+
+[[topic]]
+name = "session.v1.request.get_messages"
+direction = "publish"
+description = "Request conversation history from the session capsule"
+
+[[topic]]
+name = "session.v1.request.clear"
+direction = "publish"
+description = "Request the session capsule to clear/rotate a session"
