@@ -518,10 +518,11 @@ impl ReactLoop {
                     Err(_) => continue,
                 };
 
-                let data = match payload.get("data") {
-                    Some(d) => d,
-                    None => continue,
-                };
+                // `IpcPayload::Custom { data }` is unwrapped on the host
+                // side (see `to_guest_bytes`); guests receive the inner
+                // value directly. Fall back to `payload` itself so older
+                // wrapped messages still work.
+                let data = payload.get("data").unwrap_or(&payload);
 
                 let new_session_id = data
                     .get("new_session_id")
@@ -1308,9 +1309,11 @@ impl ReactLoop {
     /// { "messages": [IpcMessage, ...], "dropped": N, "lagged": N }
     /// ```
     /// Each `IpcMessage` has `{ topic, payload, source_id, timestamp }`.
-    /// The session capsule publishes raw JSON via `publish_json`, which
-    /// the host wraps as `IpcPayload::Custom { data }`. So the actual
-    /// response data lives at `envelope.messages[0].payload.data`.
+    /// `IpcPayload::Custom { data }` is unwrapped on the host side via
+    /// `to_guest_bytes`, so guests receive the inner value directly —
+    /// `envelope.messages[0].payload` *is* the response data, not a
+    /// `{ "data": ... }` wrapper. The lookup below tolerates both
+    /// shapes for forward compatibility.
     fn fetch_messages_inner(
         session_id: &str,
         append_before_read: Option<&[Message]>,
@@ -1364,13 +1367,9 @@ impl ReactLoop {
                     }
                 };
 
-                let data = match payload.get("data") {
-                    Some(d) => d,
-                    None => {
-                        log::debug("Skipping IPC message with no data field");
-                        continue;
-                    }
-                };
+                // `IpcPayload::Custom` is unwrapped on the host side
+                // (see fn-level docs); accept both shapes for safety.
+                let data = payload.get("data").unwrap_or(&payload);
 
                 let messages: Vec<Message> = data
                     .get("messages")
@@ -1475,10 +1474,12 @@ impl ReactLoop {
 
             let poll_result = ipc::recv(&handle, DEFAULT_COMPACT_TIMEOUT_MS).ok()?;
 
-            // Navigate PollResult: first message's payload -> data
+            // Navigate PollResult: the host strips the `Custom { data }`
+            // wrapper, so the message payload IS the response data.
+            // Accept the wrapped shape too in case any producer still emits it.
             let first_msg = poll_result.messages.first()?;
             let payload: serde_json::Value = serde_json::from_str(&first_msg.payload).ok()?;
-            let data = payload.get("data")?;
+            let data = payload.get("data").unwrap_or(&payload);
 
             let compacted_msgs: Vec<serde_json::Value> =
                 serde_json::from_value(data.get("messages")?.clone()).ok()?;
