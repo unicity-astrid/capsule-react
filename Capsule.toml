@@ -19,8 +19,8 @@ type = "executable"
 [publish]
 "spark.v1.request.build" = { wit = "@unicity-astrid/wit/spark/build-request" }
 "prompt_builder.v1.assemble" = { wit = "@unicity-astrid/wit/prompt/assemble-request" }
-"agent.v1.response" = { wit = "TODO" }                                # no canonical type yet — agent response envelope
-"agent.v1.session_changed" = { wit = "TODO" }                         # no canonical type yet — agent session change notification
+"agent.v1.response" = { wit = "@unicity-astrid/wit/agent/response" }
+"agent.v1.session_changed" = { wit = "@unicity-astrid/wit/agent/session-changed" }
 "tool.v1.request.execute" = { wit = "@unicity-astrid/wit/types/tool-call" }
 "tool.v1.request.cancel" = { wit = "@unicity-astrid/wit/tool/cancel-request" }
 "llm.v1.request.generate.*" = { wit = "@unicity-astrid/wit/llm/generate-request" }
@@ -32,13 +32,13 @@ type = "executable"
 "session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
 "session.v1.response.clear.*" = { wit = "@unicity-astrid/wit/session/clear-response" }
 "context_engine.v1.response.compact" = { wit = "@unicity-astrid/wit/context/compact-response" }
-"user.v1.prompt" = { wit = "TODO", handler = "handle_user_prompt" }   # no canonical type yet — uplink user prompt envelope
+"user.v1.prompt" = { wit = "@unicity-astrid/wit/user/prompt", handler = "handle_user_prompt" }
 "spark.v1.response.ready" = { wit = "@unicity-astrid/wit/spark/build-response", handler = "handle_identity_response" }
 "prompt_builder.v1.response.assemble" = { wit = "@unicity-astrid/wit/prompt/assemble-response", handler = "handle_prompt_response" }
 "llm.v1.stream.*" = { wit = "@unicity-astrid/wit/llm/stream-event", handler = "handle_llm_stream" }
 "tool.v1.execute.result" = { wit = "@unicity-astrid/wit/types/tool-call-result", handler = "handle_tool_result" }
-"registry.v1.active_model_changed" = { wit = "TODO", handler = "handle_model_changed" }      # no canonical type yet — registry active model change
-"astrid.v1.watchdog.tick" = { wit = "TODO", handler = "handle_watchdog_tick" }               # no canonical type yet — kernel watchdog tick
-"astrid.v1.event_bus.lagged" = { wit = "TODO", handler = "handle_bus_lag" }                  # no canonical type yet — event bus lag warning
-"system.v1.lifecycle.restart" = { wit = "TODO", handler = "handle_lifecycle_restart" }       # no canonical type yet — system lifecycle signal
-"session.v1.clear" = { wit = "TODO", handler = "handle_session_clear" }                      # no canonical type yet — broadcast session-cleared signal (distinct from session.v1.request.clear)
+"registry.v1.active_model_changed" = { wit = "@unicity-astrid/wit/registry/provider-entry", handler = "handle_model_changed" }
+"astrid.v1.watchdog.tick" = { wit = "@unicity-astrid/wit/system/watchdog-tick", handler = "handle_watchdog_tick" }
+"astrid.v1.event_bus.lagged" = { wit = "@unicity-astrid/wit/system/event-bus-lagged", handler = "handle_bus_lag" }
+"system.v1.lifecycle.restart" = { wit = "@unicity-astrid/wit/system/lifecycle-restart", handler = "handle_lifecycle_restart" }
+"session.v1.clear" = { wit = "@unicity-astrid/wit/session/clear-request", handler = "handle_session_clear" }
