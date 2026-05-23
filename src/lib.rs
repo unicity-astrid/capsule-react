@@ -1296,13 +1296,12 @@ impl ReactLoop {
             timeout,
         )?;
 
-        let data = response.get("data").ok_or_else(|| {
-            SysError::ApiError(format!(
-                "Session response envelope missing 'data' field (session_id={session_id})"
-            ))
-        })?;
-
-        let messages: Vec<Message> = data
+        // Session publishes `{correlation_id, messages}` at the top
+        // level of the response payload (see
+        // `astrid-capsule-session::handle_get_messages`). No envelope
+        // wrapper — the SDK's `request_response` already deserialised
+        // the raw JSON payload; `messages` lives at the root.
+        let messages: Vec<Message> = response
             .get("messages")
             .cloned()
             .map(serde_json::from_value)
