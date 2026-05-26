@@ -488,9 +488,9 @@ impl ReactLoop {
         // Use the SDK's request_response helper: it injects a correlation
         // id, subscribes to the scoped reply topic before publishing, and
         // drops the subscription on every return path (Drop on
-        // `Subscription`). The host wraps the response in
-        // `IpcPayload::Custom { data }`, so we deserialize into a generic
-        // JSON value and unwrap the `data` field.
+        // `Subscription`). Session publishes `{correlation_id, new_session_id,
+        // old_session_id}` at the root of the reply payload (see
+        // `astrid-capsule-session::handle_clear`) — no envelope wrapper.
         let response: serde_json::Value = ipc::request_response(
             "session.v1.request.clear",
             "session.v1.response.clear",
@@ -501,11 +501,10 @@ impl ReactLoop {
         )?;
 
         let new_session_id = response
-            .get("data")
-            .and_then(|d| d.get("new_session_id"))
+            .get("new_session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SysError::ApiError("Session clear response missing data.new_session_id".into())
+                SysError::ApiError("Session clear response missing new_session_id".into())
             })?
             .to_string();
 
@@ -1271,9 +1270,10 @@ impl ReactLoop {
     ///
     /// # IPC envelope format
     ///
-    /// The session capsule publishes raw JSON via `publish_json`, which
-    /// the host wraps as `IpcPayload::Custom { data }`. So the actual
-    /// response data lives at `response.data.messages`.
+    /// Session publishes `{correlation_id, messages}` at the root of the
+    /// reply payload (see `astrid-capsule-session::handle_get_messages`).
+    /// `ipc::request_response` deserialises the raw JSON without an envelope
+    /// wrapper, so `messages` lives at the root of `response`.
     fn fetch_messages_inner(
         session_id: &str,
         append_before_read: Option<&[Message]>,
