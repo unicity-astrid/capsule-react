@@ -1314,14 +1314,101 @@ impl ReactLoop {
 
     /// Resolve the active LLM provider topic from the registry.
     fn active_llm_topic() -> String {
-        kv::get_bytes("llm_provider_topic")
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                env::var("llm_provider_topic")
-                    .unwrap_or_else(|_| "llm.v1.request.generate.anthropic".into())
-            })
+        // 1. Per-principal cache (populated by handle_model_changed for
+        //    the load-time principal, and by the fetch-on-miss path
+        //    below for every other principal).
+        //
+        //    `get_bytes_opt` distinguishes "key absent" from "key with
+        //    empty value" — important because the kernel collapsed
+        //    the SDK 0.7 `get_bytes` return for missing keys to an
+        //    empty `Vec` (see SDK kv.rs doc), so a downstream
+        //    `filter(|s| !s.is_empty())` is the only honest way to
+        //    decide cache miss vs cache hit-with-empty-value.
+        if let Ok(Some(bytes)) = kv::get_bytes_opt("llm_provider_topic")
+            && let Ok(topic) = String::from_utf8(bytes)
+            && !topic.is_empty()
+        {
+            return topic;
+        }
+        // 2. Operator env override. `env::var` collapses missing keys
+        //    to `Ok("")` (SDK 0.7 documented behaviour) — relying on
+        //    `unwrap_or_else` here used to silently bypass the
+        //    fallback default and return the empty string, which the
+        //    host then rejected as `InvalidInput` on publish. Use
+        //    `var_opt` so the missing case actually falls through.
+        if let Ok(Some(topic)) = env::var_opt("llm_provider_topic")
+            && !topic.is_empty()
+        {
+            return topic;
+        }
+        // 3. Lazy fetch from the registry capsule. Registry broadcasts
+        //    `registry.v1.active_model_changed` once at startup; every
+        //    receiver caches the topic in its load-time principal's
+        //    KV. Per-principal invocations (any non-default principal —
+        //    every gateway-minted bearer) start with an empty cache
+        //    and have to ask the registry directly the first time they
+        //    publish. Subscribe before publish to avoid a delivery
+        //    race; the subscription is dropped at scope exit.
+        if let Some(topic) = Self::fetch_active_llm_topic_from_registry() {
+            return topic;
+        }
+        // 4. Sane default. Reachable when neither the cache, env
+        //    override, nor the registry has a usable provider —
+        //    surfaces upstream as a publish failure rather than a
+        //    silent stamp on the wrong topic.
+        "llm.v1.request.generate.anthropic".into()
+    }
+
+    /// Fetch the active LLM provider's `request_topic` from the
+    /// registry capsule via a synchronous request/response round-trip.
+    /// Caches the result (topic + context window + max output tokens)
+    /// into the current principal's KV so subsequent prompts skip the
+    /// IPC hop.
+    ///
+    /// Returns `None` if the registry doesn't reply within 5s, has no
+    /// active model, or returns a payload missing `request_topic`.
+    fn fetch_active_llm_topic_from_registry() -> Option<String> {
+        const RESPONSE_TOPIC: &str = "registry.v1.response.get_active_model";
+        const REQUEST_TOPIC: &str = "registry.v1.get_active_model";
+        const TIMEOUT_MS: u64 = 5_000;
+
+        // Subscribe BEFORE publishing so the registry's reply (which
+        // may be inline-synchronous on its dispatcher task) can't slip
+        // through before we're listening.
+        let sub = ipc::subscribe(RESPONSE_TOPIC).ok()?;
+        if ipc::publish_json(REQUEST_TOPIC, &serde_json::json!({})).is_err() {
+            return None;
+        }
+        let result = sub.recv(TIMEOUT_MS).ok()?;
+        let msg = result.messages.first()?;
+
+        // Registry replies with `Option<ProviderEntry>` — JSON `null`
+        // means "no active model"; anything else is the active entry
+        // shape with a `request_topic` field.
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).ok()?;
+        let provider = payload.as_object()?;
+        let topic = provider.get("request_topic")?.as_str()?.to_string();
+        if topic.is_empty() {
+            return None;
+        }
+
+        // Best-effort cache so subsequent prompts under this principal
+        // skip the round-trip. Errors are non-fatal — a transient KV
+        // failure just means we'll re-fetch next time.
+        let _ = kv::set_bytes("llm_provider_topic", topic.as_bytes());
+        for (kv_key, payload_key) in [
+            (KV_CONTEXT_WINDOW, "context_window"),
+            (KV_MAX_OUTPUT_TOKENS, "max_output_tokens"),
+        ] {
+            if let Some(v) = provider
+                .get(payload_key)
+                .and_then(serde_json::Value::as_u64)
+            {
+                let _ = kv::set_bytes(kv_key, &v.to_le_bytes());
+            }
+        }
+
+        Some(topic)
     }
 
     /// Read cached context window from KV. Returns `None` if not yet queried.
