@@ -143,13 +143,22 @@ fn delete_call_sessions(call_ids: &[String]) {
 }
 
 /// Load the set of active session IDs from KV.
+///
+/// Cold start (key absent) returns an empty list without logging. Only
+/// a deserialization error logs a warning — that's a corrupted KV
+/// entry, the bug worth flagging. Missing-key on startup is the
+/// normal path and previously generated ERROR floods (#813).
 fn load_active_sessions() -> Vec<String> {
-    kv::get_json::<Vec<String>>(ACTIVE_SESSIONS_KEY).unwrap_or_else(|e| {
-        log::warn(format!(
-            "Failed to load active sessions from KV, defaulting to empty: {e}"
-        ));
-        Vec::new()
-    })
+    match kv::get_json_opt::<Vec<String>>(ACTIVE_SESSIONS_KEY) {
+        Ok(Some(v)) => v,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            log::warn(format!(
+                "Failed to parse active sessions from KV, defaulting to empty: {e}"
+            ));
+            Vec::new()
+        }
+    }
 }
 
 /// Add a session ID to the active sessions set.
@@ -341,10 +350,20 @@ impl TurnState {
     /// rather than risking misinterpreted fields.
     fn load(session_id: &str) -> Self {
         let key = turn_key(session_id);
-        let mut state = kv::get_json::<Self>(&key).unwrap_or_else(|e| {
-            log::error(format!("Failed to load turn state, resetting: {e}"));
-            Self::default()
-        });
+        // Cold start (key absent) returns default without logging.
+        // Only a parse failure warrants a warn — that's a corrupted KV
+        // entry. Previously this path logged ERROR on every fresh
+        // session, drowning the audit stream (#813).
+        let mut state = match kv::get_json_opt::<Self>(&key) {
+            Ok(Some(s)) => s,
+            Ok(None) => Self::default(),
+            Err(e) => {
+                log::warn(format!(
+                    "Failed to parse turn state for session '{session_id}', resetting: {e}"
+                ));
+                Self::default()
+            }
+        };
 
         if !matches!(state.schema_version, 0 | 1) {
             log::warn(format!(
