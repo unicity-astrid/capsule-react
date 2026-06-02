@@ -61,6 +61,14 @@ const DEFAULT_SESSION_TIMEOUT_MS: u64 = 2_000;
 /// Default timeout in milliseconds for context engine compact requests.
 const DEFAULT_COMPACT_TIMEOUT_MS: u64 = 5_000;
 
+/// Max times an orchestration response is bounced back through the bus to wait
+/// out a `TurnState` read-after-write visibility race (astrid#816): a previous
+/// handler's `state.save()` may not yet be visible to this handler's
+/// `TurnState::load()` when they run on different pooled Store instances close
+/// together. Each re-drive is one bus round-trip, so this spans roughly that
+/// many round-trips before giving up.
+const MAX_REDRIVE_RETRIES: u64 = 20;
+
 /// KV key for cached provider context window size (tokens).
 const KV_CONTEXT_WINDOW: &str = "react.context_window";
 
@@ -229,7 +237,7 @@ fn session_timeout_ms() -> u64 {
 }
 
 /// State machine phase for the react loop.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// No active turn. Waiting for user input.
     Idle,
@@ -671,6 +679,53 @@ impl ReactLoop {
         Ok(())
     }
 
+    /// Guard an orchestration-response handler against the `TurnState`
+    /// read-after-write visibility race (astrid#816).
+    ///
+    /// A response event (`spark.v1.response.ready`,
+    /// `prompt_builder.v1.response.assemble`, …) only fires *mid-turn* — react
+    /// sent the matching request while the turn was in `expected`. So if the
+    /// `TurnState` load comes back `Idle` (the missing/default state), that is
+    /// the race — the previous handler's `save()` on another pooled Store
+    /// isn't visible yet — not a finished turn. Bounce the response back
+    /// through the bus (the round-trip is the backoff) so it retries once the
+    /// write lands; bounded by `MAX_REDRIVE_RETRIES` so a genuinely orphaned
+    /// event can't loop forever.
+    ///
+    /// Returns `true` if the caller should return early — either a re-drive
+    /// was issued, the retry budget is spent, or the turn is in some *other*
+    /// (already-advanced / cancelled) phase that must not be retried. Returns
+    /// `false` only when the turn is in `expected` and the caller may proceed.
+    fn redrive_if_unready(
+        expected: Phase,
+        actual: Phase,
+        topic: &str,
+        payload: &serde_json::Value,
+    ) -> bool {
+        if actual == expected {
+            return false;
+        }
+        // Only `Idle` is the visibility-race signature (a fresh
+        // `TurnState::default()`). Any other phase is a genuine
+        // already-advanced or cancelled turn — return without retrying.
+        if actual == Phase::Idle {
+            let retry = payload.get("_retry").and_then(|v| v.as_u64()).unwrap_or(0);
+            if retry < MAX_REDRIVE_RETRIES {
+                let mut p = payload.clone();
+                p["_retry"] = serde_json::json!(retry + 1);
+                // Re-publish under this invocation's (preserved) principal, so
+                // the retry lands in the same KV scope.
+                let _ = ipc::publish_json(topic, &p);
+            } else {
+                log::warn(format!(
+                    "react: gave up re-driving '{topic}' after {retry} retries \
+                     (turn state never became visible)"
+                ));
+            }
+        }
+        true
+    }
+
     /// Handles `spark.v1.response.ready` events from the identity capsule.
     ///
     /// Receives the assembled system prompt and sends it to the prompt
@@ -690,7 +745,12 @@ impl ReactLoop {
             return Ok(());
         }
 
-        if state.phase != Phase::AwaitingIdentity {
+        if Self::redrive_if_unready(
+            Phase::AwaitingIdentity,
+            state.phase,
+            "spark.v1.response.ready",
+            &payload,
+        ) {
             return Ok(());
         }
 
@@ -755,7 +815,12 @@ impl ReactLoop {
             return Ok(());
         }
 
-        if state.phase != Phase::AwaitingPromptBuild {
+        if Self::redrive_if_unready(
+            Phase::AwaitingPromptBuild,
+            state.phase,
+            "prompt_builder.v1.response.assemble",
+            &payload,
+        ) {
             return Ok(());
         }
 
