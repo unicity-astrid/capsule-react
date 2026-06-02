@@ -144,12 +144,20 @@ fn delete_call_sessions(call_ids: &[String]) {
 
 /// Load the set of active session IDs from KV.
 fn load_active_sessions() -> Vec<String> {
-    kv::get_json::<Vec<String>>(ACTIVE_SESSIONS_KEY).unwrap_or_else(|e| {
-        log::warn(format!(
-            "Failed to load active sessions from KV, defaulting to empty: {e}"
-        ));
-        Vec::new()
-    })
+    // Missing key = no sessions registered yet (the cold-start norm), not an
+    // error — `get_json_opt` returns `None` rather than the old `get_json`'s
+    // spurious "EOF while parsing" on an absent key. Only a genuine parse
+    // failure warrants a warning.
+    match kv::get_json_opt::<Vec<String>>(ACTIVE_SESSIONS_KEY) {
+        Ok(Some(v)) => v,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            log::warn(format!(
+                "Corrupt active-sessions list in KV, defaulting to empty: {e}"
+            ));
+            Vec::new()
+        }
+    }
 }
 
 /// Add a session ID to the active sessions set.
@@ -341,10 +349,23 @@ impl TurnState {
     /// rather than risking misinterpreted fields.
     fn load(session_id: &str) -> Self {
         let key = turn_key(session_id);
-        let mut state = kv::get_json::<Self>(&key).unwrap_or_else(|e| {
-            log::error(format!("Failed to load turn state, resetting: {e}"));
-            Self::default()
-        });
+        // Distinguish a *missing* key (a brand-new session — the normal cold
+        // path, not an error) from *corrupt* stored bytes. The old
+        // `get_json` collapsed both into "EOF while parsing" via
+        // `get_bytes`'s `unwrap_or_default()`, so every cold load logged a
+        // spurious ERROR and reset to default. With genuine concurrency
+        // (the Store pool, #816) those cold loads are frequent, so the
+        // distinction matters: only a real parse failure is worth a warning.
+        let mut state = match kv::get_json_opt::<Self>(&key) {
+            Ok(Some(s)) => s,
+            Ok(None) => Self::default(),
+            Err(e) => {
+                log::warn(format!(
+                    "Corrupt turn state for session '{session_id}', resetting: {e}"
+                ));
+                Self::default()
+            }
+        };
 
         if !matches!(state.schema_version, 0 | 1) {
             log::warn(format!(
