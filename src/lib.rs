@@ -712,10 +712,21 @@ impl ReactLoop {
             let retry = payload.get("_retry").and_then(|v| v.as_u64()).unwrap_or(0);
             if retry < MAX_REDRIVE_RETRIES {
                 let mut p = payload.clone();
-                p["_retry"] = serde_json::json!(retry + 1);
-                // Re-publish under this invocation's (preserved) principal, so
-                // the retry lands in the same KV scope.
-                let _ = ipc::publish_json(topic, &p);
+                // Guard the mutation: `p["_retry"] = …` panics if the payload
+                // isn't a JSON object. Re-publish under this invocation's
+                // (preserved) principal so the retry lands in the same KV
+                // scope, and surface a failed re-drive (e.g. `CapabilityDenied`)
+                // rather than silently dropping the event.
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("_retry".to_string(), serde_json::json!(retry + 1));
+                    if let Err(e) = ipc::publish_json(topic, &p) {
+                        log::warn(format!("react: failed to re-drive '{topic}': {e:?}"));
+                    }
+                } else {
+                    log::warn(format!(
+                        "react: cannot re-drive '{topic}' — payload is not a JSON object"
+                    ));
+                }
             } else {
                 log::warn(format!(
                     "react: gave up re-driving '{topic}' after {retry} retries \
@@ -1472,7 +1483,16 @@ impl ReactLoop {
         // means "no active model"; anything else is the active entry
         // shape with a `request_topic` field.
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).ok()?;
-        let provider = payload.as_object()?;
+        // `null` is the valid "no active model" reply; anything that isn't an
+        // object is a corrupt/unexpected response worth a warning rather than a
+        // silent `None` (which is indistinguishable from "no model").
+        if payload.is_null() {
+            return None;
+        }
+        let provider = payload.as_object().or_else(|| {
+            log::warn("react: registry active-model response is not a JSON object");
+            None
+        })?;
         let topic = provider.get("request_topic")?.as_str()?.to_string();
         if topic.is_empty() {
             return None;

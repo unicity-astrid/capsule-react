@@ -36,6 +36,14 @@ type = "executable"
 # `handle_prompt_response`.
 "registry.v1.get_active_model" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
 
+# `redrive_if_unready` bounces these response topics back onto the bus as a
+# bounded retry when the turn state isn't visible yet (the round-trip is the
+# backoff). Publish is gated separately from subscribe, so without these
+# declarations the re-drive fails `CapabilityDenied` and the visibility-race
+# workaround silently no-ops. Same WIT shapes as the matching [subscribe] rows.
+"spark.v1.response.ready" = { wit = "@unicity-astrid/wit/spark/build-response" }
+"prompt_builder.v1.response.assemble" = { wit = "@unicity-astrid/wit/prompt/assemble-response" }
+
 [subscribe]
 "session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
 "session.v1.response.clear.*" = { wit = "@unicity-astrid/wit/session/clear-response" }
