@@ -80,10 +80,6 @@ const KV_MAX_OUTPUT_TOKENS: &str = "react.max_output_tokens";
 /// global cache, or one principal's model would pin every other's.
 const KV_PROVIDER_MODEL: &str = "react.llm_provider_model";
 
-/// Fallback model id used when neither a per-request override, the registry
-/// selection, nor the env `model` yields one.
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
-
 /// IPC topic for context engine compact requests.
 const COMPACT_REQUEST_TOPIC: &str = "context_engine.v1.compact";
 
@@ -824,13 +820,19 @@ impl ReactLoop {
         // Resolve the active selection once so the `model` we hand the
         // prompt builder matches what the LLM request will carry (some
         // prompt-builder hooks branch on the model name). Same precedence as
-        // the request: per-request override -> registry selection -> env.
+        // the request: per-request override -> registry selection -> None.
+        //
+        // This is the earliest hop where the model is known, so it is the
+        // single fail-fast gate: if nothing is selected, terminate the turn
+        // with the "no model selected" outcome here rather than handing a
+        // fabricated/empty model to the prompt builder and the LLM. The turn
+        // is already saved in `AwaitingPromptBuild`; `fail_no_model_selected`
+        // tears it down to `Idle` cleanly.
         let active = Self::active_llm();
-        let model = resolve_request_model(
-            state.request_model_override.as_deref(),
-            &active,
-            env::var_opt("model").ok().flatten(),
-        );
+        let Some(model) = resolve_request_model(state.request_model_override.as_deref(), &active)
+        else {
+            return Self::fail_no_model_selected(&mut state);
+        };
 
         // Derive the active provider from the registry's LLM topic
         // (independent of the model id — strips the topic prefix).
@@ -910,7 +912,7 @@ impl ReactLoop {
         state.set_phase(Phase::Streaming);
         state.save()?;
 
-        Self::publish_llm_request(&state, &messages)
+        Self::publish_llm_request(&mut state, &messages)
     }
 
     /// Handles `llm.stream.*` events from the LLM provider capsule.
@@ -1129,7 +1131,7 @@ impl ReactLoop {
         // Safe to clean up now - new state is committed.
         delete_call_sessions(&call_ids);
 
-        Self::publish_llm_request(&state, &messages)
+        Self::publish_llm_request(&mut state, &messages)
     }
 
     /// Handle active model change from the registry capsule.
@@ -1234,10 +1236,11 @@ impl ReactLoop {
 ///
 /// `topic` is load-bearing and always non-empty (it is what react publishes
 /// to). `model` is optional: a malformed or legacy registry reply may lack
-/// `id`, in which case `resolve_request_model` falls through to the env
-/// default. react treats `model` as an opaque string — it never splits a
-/// `<capsule>:<model>` qualifier; that canonicalisation is the registry's
-/// concern.
+/// `id`, in which case `resolve_request_model` yields `None` (no per-request
+/// override either) and the turn terminates with the "no model selected"
+/// outcome — there is no fabricated fallback. react treats `model` as an
+/// opaque string — it never splits a `<capsule>:<model>` qualifier; that
+/// canonicalisation is the registry's concern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveLlm {
     topic: String,
@@ -1387,22 +1390,20 @@ fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
 ///
 /// 1. Per-request override (`context.model` from the originating prompt).
 /// 2. Active registry selection (`ProviderEntry.id`).
-/// 3. Env `model`, then the literal [`DEFAULT_MODEL`].
 ///
-/// Each tier is skipped when empty, so an empty override or an empty
-/// registry id never shadows a usable lower tier. All inputs are opaque
-/// strings — passed through verbatim.
-fn resolve_request_model(
-    override_model: Option<&str>,
-    active: &ActiveLlm,
-    env_model: Option<String>,
-) -> String {
+/// Each tier is skipped when empty, so an empty override never shadows a
+/// usable registry id. All inputs are opaque strings — passed through
+/// verbatim. Returns `None` when neither tier yields a usable id: there is
+/// **no fabricated default**. A literal fallback (historically a Claude id)
+/// could be stamped onto a non-Anthropic provider's request, so when nothing
+/// is selected react surfaces a "no model selected" turn outcome instead of
+/// inventing one. The registry already auto-selects a default provider when
+/// any provider is installed, so `None` means genuinely nothing is available.
+fn resolve_request_model(override_model: Option<&str>, active: &ActiveLlm) -> Option<String> {
     override_model
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .or_else(|| active.model.clone().filter(|s| !s.is_empty()))
-        .or_else(|| env_model.filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| DEFAULT_MODEL.into())
 }
 
 impl ReactLoop {
@@ -1589,22 +1590,55 @@ impl ReactLoop {
         state.save()
     }
 
+    /// Actionable message shown to the user when no LLM model is selected.
+    const NO_MODEL_MESSAGE: &'static str = "No LLM model is selected. Run `astrid models` to choose one, or install/configure an LLM provider.";
+
+    /// Terminally fail the turn because no LLM model is selected.
+    ///
+    /// react must never fabricate a model id when nothing is selected — a
+    /// literal fallback could send e.g. a Claude id to a non-Anthropic
+    /// provider. This is a TERMINAL turn outcome, so it tears the turn down on
+    /// the same terminal-teardown discipline every other failure path uses
+    /// (stream error, timeout, iteration cap): surface an actionable error to
+    /// the frontend, clean up the in-flight KV correlation mappings, reset the
+    /// conversation turn, and return to `Idle` — `set_phase(Idle)` also
+    /// unregisters the session from the watchdog's active set. No
+    /// `llm.v1.request.generate.*` request is published.
+    fn fail_no_model_selected(state: &mut TurnState) -> Result<(), SysError> {
+        log::error("No LLM model selected; aborting turn without publishing an LLM request");
+        let _ = ipc::publish_json(
+            "agent.v1.response",
+            &IpcPayload::AgentResponse {
+                text: Self::NO_MODEL_MESSAGE.to_string(),
+                is_final: true,
+                session_id: state.session_id.clone(),
+            },
+        );
+        Self::cleanup_inflight_mappings(state);
+        state.reset_conversation_turn();
+        state.set_phase(Phase::Idle);
+        state.save()
+    }
+
     /// Publish an LLM generation request to the provider capsule.
     ///
     /// Tools and messages are provided by the caller — either from the prompt
     /// builder response (initial request) or from turn state (tool iterations).
     /// Messages are compacted via the context engine if a context window budget
     /// is available.
-    fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
+    ///
+    /// When no model can be resolved (no per-request override and no registry
+    /// selection), the turn is terminated with the "no model selected" outcome
+    /// instead of publishing a request with a fabricated model id.
+    fn publish_llm_request(state: &mut TurnState, messages: &[Message]) -> Result<(), SysError> {
         // Resolve topic + model together so the request carries the
-        // registry's selected model id, not react's own env default.
-        // Precedence: per-request override -> registry selection -> env.
+        // registry's selected model id, never a fabricated default.
+        // Precedence: per-request override -> registry selection -> None.
         let active = Self::active_llm();
-        let model = resolve_request_model(
-            state.request_model_override.as_deref(),
-            &active,
-            env::var_opt("model").ok().flatten(),
-        );
+        let Some(model) = resolve_request_model(state.request_model_override.as_deref(), &active)
+        else {
+            return Self::fail_no_model_selected(state);
+        };
 
         let llm_topic = active.topic;
 
@@ -1707,8 +1741,9 @@ impl ReactLoop {
     /// resolution as before (per-principal cache -> operator env override ->
     /// lazy registry fetch -> sane default). The model id rides alongside it:
     /// it is read from the same cache / registry reply, and is `None` on the
-    /// env-override and hardcoded-default paths (no model id is available
-    /// there) — `resolve_request_model` then falls through to the env model.
+    /// env-override and topic-default paths (no model id is available there) —
+    /// `resolve_request_model` then yields `None` and the turn terminates with
+    /// the "no model selected" outcome.
     fn active_llm() -> ActiveLlm {
         // 1. Per-principal cache (populated by handle_model_changed for
         //    the load-time principal, and by the fetch-on-miss path
@@ -1758,10 +1793,11 @@ impl ReactLoop {
         if let Some(active) = Self::fetch_active_llm_topic_from_registry() {
             return active;
         }
-        // 4. Sane default. Reachable when neither the cache, env
-        //    override, nor the registry has a usable provider —
-        //    surfaces upstream as a publish failure rather than a
-        //    silent stamp on the wrong topic.
+        // 4. Sane topic default. Reachable when neither the cache, env
+        //    override, nor the registry has a usable provider. It carries
+        //    no model id, so `resolve_request_model` yields `None` and the
+        //    turn terminates with the "no model selected" outcome rather
+        //    than silently stamping a fabricated model on this topic.
         ActiveLlm {
             topic: "llm.v1.request.generate.anthropic".into(),
             model: None,
@@ -1777,8 +1813,8 @@ impl ReactLoop {
     /// Returns `None` if the registry doesn't reply within 5s, has no
     /// active model, or returns a payload missing `request_topic`. A reply
     /// with a topic but no `id` returns `Some(ActiveLlm { model: None, .. })`
-    /// — the topic is the required field; the model falls through to the env
-    /// default downstream.
+    /// — the topic is the required field; a `None` model then yields the
+    /// "no model selected" turn outcome downstream (no fabricated default).
     fn fetch_active_llm_topic_from_registry() -> Option<ActiveLlm> {
         const RESPONSE_TOPIC: &str = "registry.v1.response.get_active_model";
         const REQUEST_TOPIC: &str = "registry.v1.get_active_model";
@@ -1993,43 +2029,68 @@ mod tests {
         let parsed = parse_active_provider(&reply).expect("active provider parses");
         assert_eq!(parsed.model.as_deref(), Some("qwen2.5-coder:32b"));
 
-        // With no override, the registry id wins over the env default —
-        // before the fix the env value always won.
-        let resolved =
-            resolve_request_model(None, &parsed, Some("claude-sonnet-4-20250514".to_string()));
-        assert_eq!(resolved, "qwen2.5-coder:32b");
+        // With no override, the registry id is resolved.
+        let resolved = resolve_request_model(None, &parsed);
+        assert_eq!(resolved.as_deref(), Some("qwen2.5-coder:32b"));
     }
 
     #[test]
     fn request_model_override_beats_registry() {
         let active = active("llm.v1.request.generate.openai", Some("gpt-5.4-registry"));
 
-        // The per-request `context.model` override wins over both the
-        // registry selection and the env default.
-        let resolved =
-            resolve_request_model(Some("gpt-5.4"), &active, Some("env-model".to_string()));
-        assert_eq!(resolved, "gpt-5.4");
+        // The per-request `context.model` override wins over the registry
+        // selection.
+        let resolved = resolve_request_model(Some("gpt-5.4"), &active);
+        assert_eq!(resolved.as_deref(), Some("gpt-5.4"));
 
         // An empty override is ignored — the registry id wins.
-        let resolved_empty =
-            resolve_request_model(Some(""), &active, Some("env-model".to_string()));
-        assert_eq!(resolved_empty, "gpt-5.4-registry");
+        let resolved_empty = resolve_request_model(Some(""), &active);
+        assert_eq!(resolved_empty.as_deref(), Some("gpt-5.4-registry"));
     }
 
     #[test]
-    fn request_model_falls_back_when_no_selection() {
+    fn request_model_is_none_when_no_selection() {
         // JSON `null` is the registry's "no active model" reply.
         assert!(parse_active_provider(&serde_json::Value::Null).is_none());
 
-        // No override, no registry model -> env model.
+        // No override and no registry model resolves to `None` — there is NO
+        // env or literal fallback. The old impl returned the literal
+        // `"claude-sonnet-4-20250514"` here, fabricating a Claude id for any
+        // provider; this asserts that fabrication is gone. A `None` here is
+        // what drives the terminal "no model selected" turn outcome, so react
+        // never publishes an `llm.v1.request.generate.*` request with an
+        // invented model.
         let no_model = active("llm.v1.request.generate.anthropic", None);
-        let resolved = resolve_request_model(None, &no_model, Some("env-model".to_string()));
-        assert_eq!(resolved, "env-model");
+        assert_eq!(resolve_request_model(None, &no_model), None);
+    }
 
-        // No override, no registry model, no env -> hardcoded default.
-        let resolved_default = resolve_request_model(None, &no_model, None);
-        assert_eq!(resolved_default, DEFAULT_MODEL);
-        assert_eq!(resolved_default, "claude-sonnet-4-20250514");
+    #[test]
+    fn no_model_turn_does_not_publish_a_request() {
+        // `publish_llm_request` and the `handle_identity_response` gate both
+        // branch on exactly this decision: when `resolve_request_model` is
+        // `None`, they call `fail_no_model_selected` and return WITHOUT
+        // reaching any `ipc::publish_json("llm.v1.request.generate.*", ..)`.
+        // The publish is IO-buried (the SDK host imports trap off-wasm), so we
+        // pin the documented decision seam here: a `None` resolution is the
+        // sole input that diverts the turn off the publish path.
+        let no_model = active("llm.v1.request.generate.anthropic", None);
+        let resolved = resolve_request_model(None, &no_model);
+        assert!(
+            resolved.is_none(),
+            "no selection must resolve to None, which is what suppresses the LLM request publish",
+        );
+
+        // A real selection (override or registry id) is `Some`, which is the
+        // only branch that proceeds to publish.
+        let selected = active("llm.v1.request.generate.openai-compat", Some("qwen2.5"));
+        assert!(resolve_request_model(None, &selected).is_some());
+        assert!(resolve_request_model(Some("override-model"), &no_model).is_some());
+
+        // The terminal outcome the gate emits is the actionable no-model
+        // message — it points the user at `astrid models` / provider setup,
+        // never a fabricated model name.
+        assert!(ReactLoop::NO_MODEL_MESSAGE.contains("astrid models"));
+        assert!(!ReactLoop::NO_MODEL_MESSAGE.contains("claude"));
     }
 
     #[test]
@@ -2043,13 +2104,12 @@ mod tests {
         let parsed = parse_active_provider(&reply).expect("active provider parses");
         assert_eq!(parsed.model.as_deref(), Some("llama3.3:70b"));
 
-        let resolved = resolve_request_model(None, &parsed, None);
-        assert_eq!(resolved, "llama3.3:70b");
+        let resolved = resolve_request_model(None, &parsed);
+        assert_eq!(resolved.as_deref(), Some("llama3.3:70b"));
 
         // Same opacity for a colon-bearing `context.model` override.
-        let resolved_override =
-            resolve_request_model(Some("vendor:custom-model:v2"), &parsed, None);
-        assert_eq!(resolved_override, "vendor:custom-model:v2");
+        let resolved_override = resolve_request_model(Some("vendor:custom-model:v2"), &parsed);
+        assert_eq!(resolved_override.as_deref(), Some("vendor:custom-model:v2"));
     }
 
     #[test]
@@ -2063,9 +2123,8 @@ mod tests {
         assert_eq!(parsed.topic, "llm.v1.request.generate.anthropic");
         assert_eq!(parsed.model, None);
 
-        // The missing model falls through to the env default.
-        let resolved = resolve_request_model(None, &parsed, Some("env-model".to_string()));
-        assert_eq!(resolved, "env-model");
+        // A missing model id resolves to `None` — no fabricated fallback.
+        assert_eq!(resolve_request_model(None, &parsed), None);
     }
 
     #[test]
@@ -2076,8 +2135,8 @@ mod tests {
         // the `id` verbatim, so an empty `id` became `Some("")` — inconsistent
         // with `cached_model_action` (empty => Clear) and the `active_llm`
         // cache-hit path (empty cached model => None), the two other inputs to
-        // `ActiveLlm`. An empty model would then survive into the request and
-        // shadow the env/default fallback in `resolve_request_model`.
+        // `ActiveLlm`. An empty model would then survive into the request as a
+        // usable (but invalid) selection in `resolve_request_model`.
         let empty = serde_json::json!({
             "id": "",
             "request_topic": "llm.v1.request.generate.openai-compat",
@@ -2093,10 +2152,9 @@ mod tests {
         });
         assert_eq!(parse_active_provider(&blank).unwrap().model, None);
 
-        // With no usable registry model the resolution falls through to the env
-        // default — the empty id never shadows it.
-        let resolved = resolve_request_model(None, &parsed, Some("env-model".to_string()));
-        assert_eq!(resolved, "env-model");
+        // With no usable registry model the resolution yields `None` — the
+        // empty id is never paired into a request and there is no fallback.
+        assert_eq!(resolve_request_model(None, &parsed), None);
     }
 
     #[test]
