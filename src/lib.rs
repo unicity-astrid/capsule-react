@@ -1155,8 +1155,20 @@ impl ReactLoop {
             // Best-effort — a delete failure is non-fatal; the next fetch-on-
             // miss path will overwrite stale entries anyway.
             BroadcastAction::ClearAll => {
-                let _ = kv::delete("llm_provider_topic");
-                let _ = kv::delete(KV_PROVIDER_MODEL);
+                // Drop every provider-specific cache key so a cleared selection
+                // starts from a clean slate. The topic and model keys must go
+                // (a warm-cache react would otherwise keep serving the unset
+                // model). The context-window limits must go too: they are only
+                // ever overwritten by a later `SetTopic`/fetch when the *new*
+                // provider supplies them, so if the next provider's reply omits
+                // those fields the unset provider's limits would survive and
+                // keep clamping requests. `cleared_cache_keys` is the single
+                // source of truth for this set (pinned by a regression test);
+                // each delete is best-effort — the next fetch-on-miss path
+                // overwrites any stale entry anyway.
+                for key in cleared_cache_keys() {
+                    let _ = kv::delete(key);
+                }
             }
             BroadcastAction::SetTopic(topic) => {
                 kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
@@ -1250,6 +1262,27 @@ enum BroadcastAction {
     Ignore,
 }
 
+/// The full set of provider-specific KV cache keys that a `ClearAll`
+/// (`astrid models unset`) must drop. Pure so the deletion list is testable
+/// without a live bus — the SDK `astrid:kv` imports trap off-wasm, so the
+/// interceptor's actual `kv::delete` calls can't run in a host test.
+///
+/// All four keys are written together when a provider is selected
+/// (topic + model id via `handle_model_changed`, context-window + max-output
+/// via the same broadcast / fetch path) and so must be cleared together.
+/// Leaving any behind lets a warm-cache react serve the unset provider's
+/// state: the topic/model would re-route to the old provider, and the
+/// context-window limits would keep clamping requests to the old provider's
+/// token budget.
+fn cleared_cache_keys() -> [&'static str; 4] {
+    [
+        "llm_provider_topic",
+        KV_PROVIDER_MODEL,
+        KV_CONTEXT_WINDOW,
+        KV_MAX_OUTPUT_TOKENS,
+    ]
+}
+
 /// Decide how `handle_model_changed` must treat an `active_model_changed`
 /// broadcast payload.
 ///
@@ -1309,17 +1342,25 @@ fn cached_model_action(payload: &serde_json::Value) -> ModelCacheAction {
 
 /// Parse a registry active-model reply into an [`ActiveLlm`].
 ///
-/// Reads `request_topic` (required, non-empty) and `id` (the selected model
-/// id, optional). Returns `None` for JSON `null` (no active model), a
-/// non-object payload, or an empty/absent `request_topic`. The `id` is read
-/// verbatim — never split or reinterpreted.
+/// Reads `request_topic` (required) and `id` (the selected model id, optional).
+/// Returns `None` for JSON `null` (no active model), a non-object payload, an
+/// empty/absent `request_topic`, or a `request_topic` that does not start with
+/// the `llm.v1.request.generate.` provider prefix. The `id` is read verbatim —
+/// never split or reinterpreted.
+///
+/// The prefix check is the same defense-in-depth that the broadcast path
+/// applies in [`broadcast_action`]. Without it the cache-MISS fetch path would
+/// accept and cache *any* non-empty topic a buggy or compromised registry
+/// returned, then publish the next LLM request to it — while a forged broadcast
+/// of the same shape would be rejected. Both paths feed the same cache, so both
+/// must enforce the same provider-topic invariant.
 fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
     if payload.is_null() {
         return None;
     }
     let provider = payload.as_object()?;
     let topic = provider.get("request_topic")?.as_str()?.to_string();
-    if topic.is_empty() {
+    if !topic.starts_with("llm.v1.request.generate.") {
         return None;
     }
     let model = provider
@@ -2140,6 +2181,62 @@ mod tests {
             broadcast_action(&broadcast),
             BroadcastAction::SetTopic("llm.v1.request.generate.openai-compat".to_string())
         );
+    }
+
+    #[test]
+    fn cleared_broadcast_drops_context_window_keys() {
+        // Regression: `ClearAll` (`astrid models unset`) must drop the
+        // provider-specific context-window limits, not just the topic and model
+        // keys. The limits are only ever overwritten by a later select/fetch
+        // when the *new* provider supplies them, so if they survived an unset a
+        // warm-cache react would keep clamping requests to the unset provider's
+        // token budget. The interceptor iterates `cleared_cache_keys` (the
+        // kv::delete calls themselves can't run off-wasm — the SDK kv imports
+        // trap), so pinning that set here is the cleared-cache assertion in pure
+        // form. Before the fix this list was the topic + model keys only.
+        let keys = cleared_cache_keys();
+        assert!(
+            keys.contains(&KV_CONTEXT_WINDOW),
+            "ClearAll must drop the cached context window"
+        );
+        assert!(
+            keys.contains(&KV_MAX_OUTPUT_TOKENS),
+            "ClearAll must drop the cached max output tokens"
+        );
+        // The topic and model keys must still be dropped — clearing the limits
+        // is additive, not a replacement.
+        assert!(keys.contains(&"llm_provider_topic"));
+        assert!(keys.contains(&KV_PROVIDER_MODEL));
+    }
+
+    #[test]
+    fn active_provider_rejects_bad_prefix_topic() {
+        // Regression: the cache-MISS fetch path feeds `parse_active_provider`
+        // and caches/publishes whatever topic it returns. A buggy or
+        // compromised registry reply with a non-provider topic must be rejected
+        // here — exactly as the broadcast path rejects it in `broadcast_action`
+        // — so a forged topic is never cached and published to. Before the fix
+        // `parse_active_provider` accepted any non-empty topic, leaving the two
+        // paths asymmetric.
+        let reply = serde_json::json!({
+            "id": "some-model",
+            "request_topic": "evil.topic",
+        });
+        assert!(parse_active_provider(&reply).is_none());
+
+        // A topic that merely contains the prefix but doesn't start with it is
+        // also rejected — `starts_with`, not `contains`.
+        let prefix_not_at_start = serde_json::json!({
+            "request_topic": "evil.llm.v1.request.generate.openai-compat",
+        });
+        assert!(parse_active_provider(&prefix_not_at_start).is_none());
+
+        // The valid provider prefix still parses — the check rejects forgeries,
+        // not legitimate provider topics.
+        let valid = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert!(parse_active_provider(&valid).is_some());
     }
 
     #[test]
