@@ -686,13 +686,15 @@ impl ReactLoop {
         // spark + prompt-builder bus hops, so the only way the override
         // survives to the request is via persisted state. Set it AFTER the
         // reset so the reset (which clears it) does not wipe this turn's
-        // value. Empty/absent => None => fall through to the registry
-        // selection. The string is opaque — react never parses it.
+        // value. Empty/whitespace-only/absent => None => fall through to
+        // the registry selection (consistent with `parse_active_provider`,
+        // which treats a whitespace-only id as absent). The string is
+        // opaque — react never parses it beyond this presence check.
         state.request_model_override = context
             .as_ref()
             .and_then(|c| c.get("model"))
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .map(str::to_owned);
 
         state.set_phase(Phase::AwaitingIdentity);
@@ -1151,8 +1153,10 @@ impl ReactLoop {
             // Cleared signal (`null` payload): drop the topic and model cache
             // keys for this principal. The next `active_llm` misses both, does
             // a fresh registry round-trip, and picks up the auto-selected
-            // default (or falls through to the env default if none). Without
-            // this, an `unset` silently no-ops for a warm-cache react.
+            // default — or, if the registry has no provider either, resolves
+            // to no model and the turn terminates with the "no model selected"
+            // outcome (there is no env/literal fallback). Without this, an
+            // `unset` silently no-ops for a warm-cache react.
             //
             // Best-effort — a delete failure is non-fatal; the next fetch-on-
             // miss path will overwrite stale entries anyway.
@@ -1194,11 +1198,13 @@ impl ReactLoop {
                         let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
                     }
                     // Migration-window case: the broadcast carries a valid topic
-                    // but no (or an empty) `id`. The previous selection's model
-                    // id must NOT survive — clearing it makes the cache-hit path
-                    // in `active_llm` report `model: None`, so the new provider
-                    // gets its own env/default model rather than the old
-                    // provider's stale id.
+                    // but no (or an empty/whitespace-only) `id`. The previous
+                    // selection's model id must NOT survive — clearing it makes
+                    // the cache-hit path in `active_llm` report `model: None`,
+                    // so resolution yields no model and the turn terminates with
+                    // the "no model selected" outcome rather than pairing the new
+                    // topic with the old provider's stale id (there is no
+                    // env/literal fallback).
                     ModelCacheAction::Clear => {
                         let _ = kv::delete(KV_PROVIDER_MODEL);
                     }
@@ -1342,10 +1348,11 @@ enum ModelCacheAction {
 /// model id in place — `active_llm` would then pair the new topic with the old
 /// provider's model, sending a foreign model name to the new provider.
 ///
-/// The `id` is read verbatim; an empty string is treated as absent.
+/// The `id` is read verbatim; an empty or whitespace-only string is treated
+/// as absent (consistent with `parse_active_provider`).
 fn cached_model_action(payload: &serde_json::Value) -> ModelCacheAction {
     match payload.get("id").and_then(|v| v.as_str()) {
-        Some(model) if !model.is_empty() => ModelCacheAction::Set(model.to_owned()),
+        Some(model) if !model.trim().is_empty() => ModelCacheAction::Set(model.to_owned()),
         _ => ModelCacheAction::Clear,
     }
 }
@@ -1391,9 +1398,11 @@ fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
 /// 1. Per-request override (`context.model` from the originating prompt).
 /// 2. Active registry selection (`ProviderEntry.id`).
 ///
-/// Each tier is skipped when empty, so an empty override never shadows a
-/// usable registry id. All inputs are opaque strings — passed through
-/// verbatim. Returns `None` when neither tier yields a usable id: there is
+/// Each tier is skipped when empty or whitespace-only (consistent with
+/// `parse_active_provider`), so a blank override never shadows a usable
+/// registry id. All inputs are opaque strings — passed through verbatim
+/// once a tier clears the presence check. Returns `None` when neither tier
+/// yields a usable id: there is
 /// **no fabricated default**. A literal fallback (historically a Claude id)
 /// could be stamped onto a non-Anthropic provider's request, so when nothing
 /// is selected react surfaces a "no model selected" turn outcome instead of
@@ -1401,9 +1410,9 @@ fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
 /// any provider is installed, so `None` means genuinely nothing is available.
 fn resolve_request_model(override_model: Option<&str>, active: &ActiveLlm) -> Option<String> {
     override_model
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(str::to_owned)
-        .or_else(|| active.model.clone().filter(|s| !s.is_empty()))
+        .or_else(|| active.model.clone().filter(|s| !s.trim().is_empty()))
 }
 
 impl ReactLoop {
@@ -1750,8 +1759,11 @@ impl ReactLoop {
         //    below for every other principal). Read BOTH keys: a cached
         //    topic with a missing model key is the migration window (a
         //    principal cached its topic before this change shipped) —
-        //    honour the topic and fall through to the env/default model,
-        //    never invalidate the topic just because the model is absent.
+        //    honour the topic and report `model: None`, never invalidate
+        //    the topic just because the model is absent. A `None` model
+        //    then resolves to no model and the turn terminates with the
+        //    "no model selected" outcome (there is no env/literal
+        //    fallback model).
         //
         //    `get_bytes_opt` distinguishes "key absent" from "key with
         //    empty value" — important because the kernel collapsed
@@ -1767,7 +1779,7 @@ impl ReactLoop {
                 .ok()
                 .flatten()
                 .and_then(|b| String::from_utf8(b).ok())
-                .filter(|m| !m.is_empty());
+                .filter(|m| !m.trim().is_empty());
             return ActiveLlm { topic, model };
         }
         // 2. Operator env override. `env::var` collapses missing keys
@@ -1850,10 +1862,12 @@ impl ReactLoop {
         // Reconcile the cached model id with the freshly-fetched topic, the
         // same way `handle_model_changed` does on the broadcast path. The two
         // keys can evict independently, so a fresh topic must never inherit a
-        // previously-cached model id: when the reply carries no (or an empty)
-        // `id`, the stale `KV_PROVIDER_MODEL` is deleted so the cache-hit path
-        // in `active_llm` reports `model: None` and the new provider falls
-        // through to its env/default model. Reuses the shared pure decision.
+        // previously-cached model id: when the reply carries no (or an
+        // empty/whitespace-only) `id`, the stale `KV_PROVIDER_MODEL` is deleted
+        // so the cache-hit path in `active_llm` reports `model: None`, which
+        // resolves to no model and terminates the turn with the "no model
+        // selected" outcome (there is no env/literal fallback). Reuses the
+        // shared pure decision.
         match cached_model_action(&payload) {
             ModelCacheAction::Set(model) => {
                 let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
@@ -2155,6 +2169,58 @@ mod tests {
         // With no usable registry model the resolution yields `None` — the
         // empty id is never paired into a request and there is no fallback.
         assert_eq!(resolve_request_model(None, &parsed), None);
+    }
+
+    #[test]
+    fn whitespace_only_model_id_is_absent_across_paths() {
+        // Regression: a whitespace-only id (e.g. " ", "\t", "\n") is just as
+        // unusable as an empty one and must resolve to NO model on every path
+        // that feeds a request, consistent with `parse_active_provider` (which
+        // already trims). Before the fix these paths checked `!is_empty()`, so a
+        // single space slipped through as a "selection" and got published to the
+        // provider as a model name. The pure decision seams pinned here are the
+        // same ones the IO-buried call sites (`handle_user_prompt`'s
+        // `context.model` filter, `active_llm`'s cached-model filter) delegate
+        // to, so trimming here is trimming there.
+        for blank in ["   ", "\t", "\n", " \t\n "] {
+            // Tier 1: a whitespace-only `context.model` override never shadows a
+            // usable registry id — it is treated as absent and the registry id
+            // wins.
+            let with_registry = active("llm.v1.request.generate.openai", Some("gpt-5.4-registry"));
+            assert_eq!(
+                resolve_request_model(Some(blank), &with_registry).as_deref(),
+                Some("gpt-5.4-registry"),
+                "whitespace override must not shadow the registry id",
+            );
+
+            // Tier 2: a whitespace-only registry/cache model id resolves to
+            // `None` (no fabricated fallback), driving the terminal "no model
+            // selected" outcome rather than publishing a blank model.
+            let blank_registry = active("llm.v1.request.generate.openai-compat", Some(blank));
+            assert_eq!(
+                resolve_request_model(None, &blank_registry),
+                None,
+                "whitespace registry id must resolve to no model",
+            );
+
+            // Both tiers blank => `None`.
+            assert_eq!(resolve_request_model(Some(blank), &blank_registry), None);
+
+            // `cached_model_action` (the shared reconcile decision used by both
+            // the broadcast and registry-fetch cache paths) treats a
+            // whitespace-only `id` as absent => Clear, so a warm cache never
+            // pairs the new topic with a blank model.
+            let broadcast = serde_json::json!({
+                "id": blank,
+                "request_topic": "llm.v1.request.generate.openai-compat",
+            });
+            assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+
+            // `parse_active_provider` agrees — the registry reply with a blank
+            // `id` yields `model: None`, keeping the three `ActiveLlm` inputs
+            // consistent.
+            assert_eq!(parse_active_provider(&broadcast).unwrap().model, None);
+        }
     }
 
     #[test]
