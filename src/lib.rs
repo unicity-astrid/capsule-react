@@ -1171,7 +1171,14 @@ impl ReactLoop {
                 }
             }
             BroadcastAction::SetTopic(topic) => {
-                kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
+                // Best-effort, consistent with the model and context-window
+                // writes below: a transient KV failure must not fail the whole
+                // interceptor. A dropped topic write just leaves the cache cold,
+                // and the next `active_llm` cache-miss re-fetches from the
+                // registry and self-heals — preferable to surfacing a `?` that
+                // aborts the broadcast handler and leaves the other writes in an
+                // inconsistent half-applied state.
+                let _ = kv::set_bytes("llm_provider_topic", topic.as_bytes());
 
                 // Reconcile the cached model id with the new selection from the
                 // same broadcast payload (the `ProviderEntry.id`). The topic and
@@ -1345,8 +1352,13 @@ fn cached_model_action(payload: &serde_json::Value) -> ModelCacheAction {
 /// Reads `request_topic` (required) and `id` (the selected model id, optional).
 /// Returns `None` for JSON `null` (no active model), a non-object payload, an
 /// empty/absent `request_topic`, or a `request_topic` that does not start with
-/// the `llm.v1.request.generate.` provider prefix. The `id` is read verbatim —
-/// never split or reinterpreted.
+/// the `llm.v1.request.generate.` provider prefix. An absent, empty, or
+/// whitespace-only `id` yields `model: None` — an empty model name is not a
+/// usable selection, so it is treated as absent rather than paired with the
+/// topic. This mirrors [`cached_model_action`] (empty `id` => `Clear`) and the
+/// `active_llm` cache-hit path (empty cached model => `None`); all three feed
+/// `ActiveLlm`, so all three must collapse an empty id the same way. A
+/// non-empty `id` is read verbatim — never split or reinterpreted.
 ///
 /// The prefix check is the same defense-in-depth that the broadcast path
 /// applies in [`broadcast_action`]. Without it the cache-MISS fetch path would
@@ -1366,6 +1378,7 @@ fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
     let model = provider
         .get("id")
         .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
         .map(str::to_owned);
     Some(ActiveLlm { topic, model })
 }
@@ -2051,6 +2064,37 @@ mod tests {
         assert_eq!(parsed.model, None);
 
         // The missing model falls through to the env default.
+        let resolved = resolve_request_model(None, &parsed, Some("env-model".to_string()));
+        assert_eq!(resolved, "env-model");
+    }
+
+    #[test]
+    fn active_provider_treats_empty_id_as_no_model() {
+        // Regression: a reply with a valid provider topic but an empty (or
+        // whitespace-only) `id` must report `model: None`, NOT pair the topic
+        // with an empty model name. Before the fix `parse_active_provider` read
+        // the `id` verbatim, so an empty `id` became `Some("")` — inconsistent
+        // with `cached_model_action` (empty => Clear) and the `active_llm`
+        // cache-hit path (empty cached model => None), the two other inputs to
+        // `ActiveLlm`. An empty model would then survive into the request and
+        // shadow the env/default fallback in `resolve_request_model`.
+        let empty = serde_json::json!({
+            "id": "",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&empty).expect("valid topic still parses");
+        assert_eq!(parsed.topic, "llm.v1.request.generate.openai-compat");
+        assert_eq!(parsed.model, None);
+
+        // A whitespace-only id is just as unusable and is treated identically.
+        let blank = serde_json::json!({
+            "id": "   ",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(parse_active_provider(&blank).unwrap().model, None);
+
+        // With no usable registry model the resolution falls through to the env
+        // default — the empty id never shadows it.
         let resolved = resolve_request_model(None, &parsed, Some("env-model".to_string()));
         assert_eq!(resolved, "env-model");
     }
