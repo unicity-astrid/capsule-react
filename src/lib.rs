@@ -1757,10 +1757,20 @@ impl ReactLoop {
         // skip the round-trip. Errors are non-fatal — a transient KV
         // failure just means we'll re-fetch next time.
         let _ = kv::set_bytes("llm_provider_topic", active.topic.as_bytes());
-        if let Some(model) = active.model.as_deref()
-            && !model.is_empty()
-        {
-            let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+        // Reconcile the cached model id with the freshly-fetched topic, the
+        // same way `handle_model_changed` does on the broadcast path. The two
+        // keys can evict independently, so a fresh topic must never inherit a
+        // previously-cached model id: when the reply carries no (or an empty)
+        // `id`, the stale `KV_PROVIDER_MODEL` is deleted so the cache-hit path
+        // in `active_llm` reports `model: None` and the new provider falls
+        // through to its env/default model. Reuses the shared pure decision.
+        match cached_model_action(&payload) {
+            ModelCacheAction::Set(model) => {
+                let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+            }
+            ModelCacheAction::Clear => {
+                let _ = kv::delete(KV_PROVIDER_MODEL);
+            }
         }
         if let Some(provider) = payload.as_object() {
             for (kv_key, payload_key) in [
@@ -2066,6 +2076,29 @@ mod tests {
             "request_topic": "llm.v1.request.generate.openai-compat",
         });
         assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+    }
+
+    #[test]
+    fn registry_fetch_reply_without_id_clears_stale_model() {
+        // Symmetric to the broadcast path: the cache-MISS registry round-trip
+        // in `fetch_active_llm_topic_from_registry` reconciles the cached model
+        // id against the SAME `cached_model_action` decision. A reply that
+        // carries a valid `request_topic` but no `id` must clear (not preserve)
+        // a previously-cached `KV_PROVIDER_MODEL`, so the freshly-fetched topic
+        // is never paired with the old provider's stale model on the next cache
+        // hit. The `Clear` arm is what drives that delete; before the fix the
+        // fetch path only conditionally *wrote* the model and never deleted,
+        // leaving the topic and model keys desynced.
+        let reply = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&reply), ModelCacheAction::Clear);
+
+        // And `parse_active_provider` — the very thing the fetch path feeds
+        // into `ActiveLlm` — yields `model: None` for that same reply, so the
+        // cleared cache and the parsed selection agree: no model id survives.
+        let active = parse_active_provider(&reply).expect("topic-bearing reply parses");
+        assert_eq!(active.model, None);
     }
 
     #[test]
