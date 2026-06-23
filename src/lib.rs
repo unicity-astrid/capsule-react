@@ -1138,54 +1138,73 @@ impl ReactLoop {
     /// route to the correct provider. Validates that the topic follows
     /// the expected `llm.request.generate.*` pattern as defense-in-depth.
     /// Caches context window limits from the provider metadata.
+    ///
+    /// A bare JSON `null` payload is the registry's *cleared* signal (emitted
+    /// on `astrid models unset` or a reconcile that genuinely clears). It must
+    /// drop BOTH cache keys so the next `active_llm` is a miss that re-asks the
+    /// registry — otherwise a warm-cache react keeps serving the unset model.
     #[astrid::interceptor("handle_model_changed")]
     pub fn handle_model_changed(&self, payload: serde_json::Value) -> Result<(), SysError> {
-        if let Some(topic) = payload.get("request_topic").and_then(|t| t.as_str()) {
-            if !topic.starts_with("llm.v1.request.generate.") {
-                log::warn(format!("Rejected model change with invalid topic: {topic}"));
-                return Ok(());
-            }
-            kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
-
-            // Reconcile the cached model id with the new selection from the
-            // same broadcast payload (the `ProviderEntry.id`). The topic and
-            // model must move together: a new topic with a stale model id is
-            // a foreign model name sent to the new provider.
+        match broadcast_action(&payload) {
+            // Cleared signal (`null` payload): drop the topic and model cache
+            // keys for this principal. The next `active_llm` misses both, does
+            // a fresh registry round-trip, and picks up the auto-selected
+            // default (or falls through to the env default if none). Without
+            // this, an `unset` silently no-ops for a warm-cache react.
             //
-            // Best-effort — a cache write/delete failure is non-fatal,
-            // consistent with the context-window cache writes below.
-            match cached_model_action(&payload) {
-                ModelCacheAction::Set(model) => {
-                    let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
-                }
-                // Migration-window case: the broadcast carries a valid topic
-                // but no (or an empty) `id`. The previous selection's model
-                // id must NOT survive — clearing it makes the cache-hit path
-                // in `active_llm` report `model: None`, so the new provider
-                // gets its own env/default model rather than the old
-                // provider's stale id.
-                ModelCacheAction::Clear => {
-                    let _ = kv::delete(KV_PROVIDER_MODEL);
-                }
+            // Best-effort — a delete failure is non-fatal; the next fetch-on-
+            // miss path will overwrite stale entries anyway.
+            BroadcastAction::ClearAll => {
+                let _ = kv::delete("llm_provider_topic");
+                let _ = kv::delete(KV_PROVIDER_MODEL);
             }
+            BroadcastAction::SetTopic(topic) => {
+                kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
 
-            // Cache context window limits from the provider metadata.
-            for (kv_key, payload_key, log_on_set) in [
-                (KV_CONTEXT_WINDOW, "context_window", true),
-                (KV_MAX_OUTPUT_TOKENS, "max_output_tokens", false),
-            ] {
-                let value = payload
-                    .get(payload_key)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
-                    log::error(format!("Failed to cache {payload_key}: {e}"));
-                } else if log_on_set && value > 0 {
-                    log::info(format!("Cached provider {payload_key}: {value} tokens"));
+                // Reconcile the cached model id with the new selection from the
+                // same broadcast payload (the `ProviderEntry.id`). The topic and
+                // model must move together: a new topic with a stale model id is
+                // a foreign model name sent to the new provider.
+                //
+                // Best-effort — a cache write/delete failure is non-fatal,
+                // consistent with the context-window cache writes below.
+                match cached_model_action(&payload) {
+                    ModelCacheAction::Set(model) => {
+                        let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+                    }
+                    // Migration-window case: the broadcast carries a valid topic
+                    // but no (or an empty) `id`. The previous selection's model
+                    // id must NOT survive — clearing it makes the cache-hit path
+                    // in `active_llm` report `model: None`, so the new provider
+                    // gets its own env/default model rather than the old
+                    // provider's stale id.
+                    ModelCacheAction::Clear => {
+                        let _ = kv::delete(KV_PROVIDER_MODEL);
+                    }
+                }
+
+                // Cache context window limits from the provider metadata.
+                for (kv_key, payload_key, log_on_set) in [
+                    (KV_CONTEXT_WINDOW, "context_window", true),
+                    (KV_MAX_OUTPUT_TOKENS, "max_output_tokens", false),
+                ] {
+                    let value = payload
+                        .get(payload_key)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
+                        log::error(format!("Failed to cache {payload_key}: {e}"));
+                    } else if log_on_set && value > 0 {
+                        log::info(format!("Cached provider {payload_key}: {value} tokens"));
+                    }
                 }
             }
-        } else {
-            log::warn("handle_model_changed: payload missing 'request_topic', ignoring");
+            BroadcastAction::RejectTopic(topic) => {
+                log::warn(format!("Rejected model change with invalid topic: {topic}"));
+            }
+            BroadcastAction::Ignore => {
+                log::warn("handle_model_changed: payload missing 'request_topic', ignoring");
+            }
         }
         Ok(())
     }
@@ -1204,6 +1223,56 @@ impl ReactLoop {
 pub(crate) struct ActiveLlm {
     topic: String,
     model: Option<String>,
+}
+
+/// What `handle_model_changed` must do with the *whole* cached selection
+/// (topic + model) when a `registry.v1.active_model_changed` broadcast lands.
+///
+/// This is the outer decision; [`ModelCacheAction`] is the inner one applied
+/// only on the topic-bearing path. Both are pure so the routing is testable
+/// without a live bus (the SDK `astrid:kv` imports trap off-wasm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BroadcastAction {
+    /// A bare JSON `null` payload — the registry's *cleared* signal
+    /// (`astrid models unset` or a reconcile that genuinely clears). Both the
+    /// topic and model cache keys must be dropped so a warm-cache react stops
+    /// serving the unset model and re-asks the registry on its next request.
+    ClearAll,
+    /// A well-formed broadcast carrying a valid `request_topic` (the
+    /// `llm.v1.request.generate.` prefix). Cache the topic and reconcile the
+    /// model id per [`cached_model_action`].
+    SetTopic(String),
+    /// A `request_topic` that does not match the expected provider-topic
+    /// prefix — rejected as defense-in-depth, leaving the cache untouched.
+    RejectTopic(String),
+    /// Any other shape (a non-null payload with no string `request_topic`) —
+    /// ignored, leaving the cache untouched.
+    Ignore,
+}
+
+/// Decide how `handle_model_changed` must treat an `active_model_changed`
+/// broadcast payload.
+///
+/// The registry sends the active `ProviderEntry` on a model *change* and a
+/// bare JSON `null` on a model *clear* (both on the same topic). A `null`
+/// payload is the only signal that the selection was unset, so it must clear
+/// the cache rather than fall through to the "missing request_topic" ignore
+/// path — otherwise a warm-cache react keeps the previously-pinned model alive
+/// across an `unset` until it happens to re-fetch.
+///
+/// The provider-topic prefix is validated here so the rejection is part of the
+/// pure decision, keeping the interceptor a thin dispatcher.
+fn broadcast_action(payload: &serde_json::Value) -> BroadcastAction {
+    if payload.is_null() {
+        return BroadcastAction::ClearAll;
+    }
+    match payload.get("request_topic").and_then(|t| t.as_str()) {
+        Some(topic) if topic.starts_with("llm.v1.request.generate.") => {
+            BroadcastAction::SetTopic(topic.to_owned())
+        }
+        Some(topic) => BroadcastAction::RejectTopic(topic.to_owned()),
+        None => BroadcastAction::Ignore,
+    }
 }
 
 /// What `handle_model_changed` must do to the cached model id
@@ -2011,5 +2080,51 @@ mod tests {
             cached_model_action(&broadcast),
             ModelCacheAction::Set("qwen2.5-coder:32b".to_string())
         );
+    }
+
+    #[test]
+    fn cleared_broadcast_clears_both_cache_keys() {
+        // The registry sends a bare JSON `null` on `active_model_changed` when
+        // the selection is cleared (`astrid models unset`). Before the fix this
+        // fell into the "missing request_topic" ignore path, so a warm-cache
+        // react kept serving the unset model. The fix routes it to `ClearAll`,
+        // which drops BOTH the topic and model cache keys — the next
+        // `active_llm` then misses and re-asks the registry.
+        let broadcast = serde_json::Value::Null;
+        assert_eq!(broadcast_action(&broadcast), BroadcastAction::ClearAll);
+    }
+
+    #[test]
+    fn normal_broadcast_still_sets_topic() {
+        // A normal `set` broadcast carries a valid `request_topic` and must
+        // still update (not clear) — the cleared-broadcast handling is scoped
+        // strictly to the `null` payload.
+        let broadcast = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(
+            broadcast_action(&broadcast),
+            BroadcastAction::SetTopic("llm.v1.request.generate.openai-compat".to_string())
+        );
+    }
+
+    #[test]
+    fn broadcast_with_invalid_topic_is_rejected() {
+        // A `request_topic` that doesn't match the provider-topic prefix is
+        // rejected as defense-in-depth, leaving the cache untouched.
+        let broadcast = serde_json::json!({ "request_topic": "evil.topic" });
+        assert_eq!(
+            broadcast_action(&broadcast),
+            BroadcastAction::RejectTopic("evil.topic".to_string())
+        );
+    }
+
+    #[test]
+    fn broadcast_missing_topic_is_ignored() {
+        // A non-null payload with no string `request_topic` is ignored — it is
+        // neither a clear nor a usable selection, so the cache is left intact.
+        let broadcast = serde_json::json!({ "id": "some-model" });
+        assert_eq!(broadcast_action(&broadcast), BroadcastAction::Ignore);
     }
 }
