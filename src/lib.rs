@@ -75,6 +75,15 @@ const KV_CONTEXT_WINDOW: &str = "react.context_window";
 /// KV key for cached provider max output tokens.
 const KV_MAX_OUTPUT_TOKENS: &str = "react.max_output_tokens";
 
+/// KV key for the cached active model id (the registry selection's
+/// `ProviderEntry.id`). Per-principal, exactly like the topic cache — no
+/// global cache, or one principal's model would pin every other's.
+const KV_PROVIDER_MODEL: &str = "react.llm_provider_model";
+
+/// Fallback model id used when neither a per-request override, the registry
+/// selection, nor the env `model` yields one.
+const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+
 /// IPC topic for context engine compact requests.
 const COMPACT_REQUEST_TOPIC: &str = "context_engine.v1.compact";
 
@@ -329,6 +338,12 @@ pub(crate) struct TurnState {
     /// Millisecond timestamp when the current phase was entered.
     #[serde(default)]
     phase_entered_at_ms: u64,
+    /// Per-request model override from the originating prompt's
+    /// `context.model` (gateway per-request selection). Takes precedence
+    /// over the registry selection for this turn only. Empty/None = no
+    /// override, fall through to the registry selection.
+    #[serde(default)]
+    request_model_override: Option<String>,
 }
 
 impl Default for TurnState {
@@ -345,6 +360,7 @@ impl Default for TurnState {
             current_tools: Vec::new(),
             iteration_count: 0,
             phase_entered_at_ms: 0,
+            request_model_override: None,
         }
     }
 }
@@ -411,6 +427,12 @@ impl TurnState {
         self.reset_turn();
         self.current_tools.clear();
         self.iteration_count = 0;
+        // A new user prompt is a new turn — the previous prompt's
+        // per-request model override must not leak forward. Cleared here
+        // (the new-prompt reset) but NOT in `reset_turn` (the per-iteration
+        // reset), so the override survives every continuation request
+        // within the same turn.
+        self.request_model_override = None;
     }
 
     /// Set the phase and record the wall-clock timestamp.
@@ -662,6 +684,21 @@ impl ReactLoop {
             Self::cleanup_inflight_mappings(&state);
         }
         state.reset_conversation_turn();
+
+        // Carry the gateway's per-request model override (`context.model`)
+        // through TurnState. `publish_llm_request` runs after the
+        // spark + prompt-builder bus hops, so the only way the override
+        // survives to the request is via persisted state. Set it AFTER the
+        // reset so the reset (which clears it) does not wipe this turn's
+        // value. Empty/absent => None => fall through to the registry
+        // selection. The string is opaque — react never parses it.
+        state.request_model_override = context
+            .as_ref()
+            .and_then(|c| c.get("model"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
         state.set_phase(Phase::AwaitingIdentity);
         register_active_session(&state.session_id);
         state.save()?;
@@ -784,11 +821,21 @@ impl ReactLoop {
 
         state.save()?;
 
-        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+        // Resolve the active selection once so the `model` we hand the
+        // prompt builder matches what the LLM request will carry (some
+        // prompt-builder hooks branch on the model name). Same precedence as
+        // the request: per-request override -> registry selection -> env.
+        let active = Self::active_llm();
+        let model = resolve_request_model(
+            state.request_model_override.as_deref(),
+            &active,
+            env::var_opt("model").ok().flatten(),
+        );
 
-        // Derive the active provider from the registry's LLM topic.
-        let llm_topic = Self::active_llm_topic();
-        let provider = llm_topic
+        // Derive the active provider from the registry's LLM topic
+        // (independent of the model id — strips the topic prefix).
+        let provider = active
+            .topic
             .strip_prefix("llm.v1.request.generate.")
             .unwrap_or("unknown")
             .to_string();
@@ -1100,6 +1147,16 @@ impl ReactLoop {
             }
             kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
 
+            // Cache the selected model id from the same broadcast payload
+            // (the `ProviderEntry.id`) alongside the topic. Best-effort —
+            // a cache write failure is non-fatal, consistent with the
+            // context-window cache writes below.
+            if let Some(model) = payload.get("id").and_then(|v| v.as_str())
+                && !model.is_empty()
+            {
+                let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+            }
+
             // Cache context window limits from the provider metadata.
             for (kv_key, payload_key, log_on_set) in [
                 (KV_CONTEXT_WINDOW, "context_window", true),
@@ -1120,6 +1177,65 @@ impl ReactLoop {
         }
         Ok(())
     }
+}
+
+/// The active LLM selection resolved from the registry: the provider topic
+/// the request is published to, and the selected model id.
+///
+/// `topic` is load-bearing and always non-empty (it is what react publishes
+/// to). `model` is optional: a malformed or legacy registry reply may lack
+/// `id`, in which case `resolve_request_model` falls through to the env
+/// default. react treats `model` as an opaque string — it never splits a
+/// `<capsule>:<model>` qualifier; that canonicalisation is the registry's
+/// concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveLlm {
+    topic: String,
+    model: Option<String>,
+}
+
+/// Parse a registry active-model reply into an [`ActiveLlm`].
+///
+/// Reads `request_topic` (required, non-empty) and `id` (the selected model
+/// id, optional). Returns `None` for JSON `null` (no active model), a
+/// non-object payload, or an empty/absent `request_topic`. The `id` is read
+/// verbatim — never split or reinterpreted.
+fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
+    if payload.is_null() {
+        return None;
+    }
+    let provider = payload.as_object()?;
+    let topic = provider.get("request_topic")?.as_str()?.to_string();
+    if topic.is_empty() {
+        return None;
+    }
+    let model = provider
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some(ActiveLlm { topic, model })
+}
+
+/// Resolve the model id for an LLM request by precedence (highest first):
+///
+/// 1. Per-request override (`context.model` from the originating prompt).
+/// 2. Active registry selection (`ProviderEntry.id`).
+/// 3. Env `model`, then the literal [`DEFAULT_MODEL`].
+///
+/// Each tier is skipped when empty, so an empty override or an empty
+/// registry id never shadows a usable lower tier. All inputs are opaque
+/// strings — passed through verbatim.
+fn resolve_request_model(
+    override_model: Option<&str>,
+    active: &ActiveLlm,
+    env_model: Option<String>,
+) -> String {
+    override_model
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| active.model.clone().filter(|s| !s.is_empty()))
+        .or_else(|| env_model.filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| DEFAULT_MODEL.into())
 }
 
 impl ReactLoop {
@@ -1313,9 +1429,17 @@ impl ReactLoop {
     /// Messages are compacted via the context engine if a context window budget
     /// is available.
     fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
-        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+        // Resolve topic + model together so the request carries the
+        // registry's selected model id, not react's own env default.
+        // Precedence: per-request override -> registry selection -> env.
+        let active = Self::active_llm();
+        let model = resolve_request_model(
+            state.request_model_override.as_deref(),
+            &active,
+            env::var_opt("model").ok().flatten(),
+        );
 
-        let llm_topic = Self::active_llm_topic();
+        let llm_topic = active.topic;
 
         // Compact messages to fit within the provider's context window.
         let messages = Self::compact_messages(&state.session_id, messages.to_vec());
@@ -1409,11 +1533,23 @@ impl ReactLoop {
         Ok(messages)
     }
 
-    /// Resolve the active LLM provider topic from the registry.
-    fn active_llm_topic() -> String {
+    /// Resolve the active LLM selection (provider topic + model id) from the
+    /// registry.
+    ///
+    /// The topic is the load-bearing field and follows the same four-tier
+    /// resolution as before (per-principal cache -> operator env override ->
+    /// lazy registry fetch -> sane default). The model id rides alongside it:
+    /// it is read from the same cache / registry reply, and is `None` on the
+    /// env-override and hardcoded-default paths (no model id is available
+    /// there) — `resolve_request_model` then falls through to the env model.
+    fn active_llm() -> ActiveLlm {
         // 1. Per-principal cache (populated by handle_model_changed for
         //    the load-time principal, and by the fetch-on-miss path
-        //    below for every other principal).
+        //    below for every other principal). Read BOTH keys: a cached
+        //    topic with a missing model key is the migration window (a
+        //    principal cached its topic before this change shipped) —
+        //    honour the topic and fall through to the env/default model,
+        //    never invalidate the topic just because the model is absent.
         //
         //    `get_bytes_opt` distinguishes "key absent" from "key with
         //    empty value" — important because the kernel collapsed
@@ -1425,18 +1561,24 @@ impl ReactLoop {
             && let Ok(topic) = String::from_utf8(bytes)
             && !topic.is_empty()
         {
-            return topic;
+            let model = kv::get_bytes_opt(KV_PROVIDER_MODEL)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|m| !m.is_empty());
+            return ActiveLlm { topic, model };
         }
         // 2. Operator env override. `env::var` collapses missing keys
         //    to `Ok("")` (SDK 0.7 documented behaviour) — relying on
         //    `unwrap_or_else` here used to silently bypass the
         //    fallback default and return the empty string, which the
         //    host then rejected as `InvalidInput` on publish. Use
-        //    `var_opt` so the missing case actually falls through.
+        //    `var_opt` so the missing case actually falls through. No
+        //    model id is available on this path.
         if let Ok(Some(topic)) = env::var_opt("llm_provider_topic")
             && !topic.is_empty()
         {
-            return topic;
+            return ActiveLlm { topic, model: None };
         }
         // 3. Lazy fetch from the registry capsule. Registry broadcasts
         //    `registry.v1.active_model_changed` once at startup; every
@@ -1446,25 +1588,31 @@ impl ReactLoop {
         //    and have to ask the registry directly the first time they
         //    publish. Subscribe before publish to avoid a delivery
         //    race; the subscription is dropped at scope exit.
-        if let Some(topic) = Self::fetch_active_llm_topic_from_registry() {
-            return topic;
+        if let Some(active) = Self::fetch_active_llm_topic_from_registry() {
+            return active;
         }
         // 4. Sane default. Reachable when neither the cache, env
         //    override, nor the registry has a usable provider —
         //    surfaces upstream as a publish failure rather than a
         //    silent stamp on the wrong topic.
-        "llm.v1.request.generate.anthropic".into()
+        ActiveLlm {
+            topic: "llm.v1.request.generate.anthropic".into(),
+            model: None,
+        }
     }
 
-    /// Fetch the active LLM provider's `request_topic` from the
+    /// Fetch the active LLM selection (`request_topic` + model `id`) from the
     /// registry capsule via a synchronous request/response round-trip.
-    /// Caches the result (topic + context window + max output tokens)
-    /// into the current principal's KV so subsequent prompts skip the
+    /// Caches the result (topic + model id + context window + max output
+    /// tokens) into the current principal's KV so subsequent prompts skip the
     /// IPC hop.
     ///
     /// Returns `None` if the registry doesn't reply within 5s, has no
-    /// active model, or returns a payload missing `request_topic`.
-    fn fetch_active_llm_topic_from_registry() -> Option<String> {
+    /// active model, or returns a payload missing `request_topic`. A reply
+    /// with a topic but no `id` returns `Some(ActiveLlm { model: None, .. })`
+    /// — the topic is the required field; the model falls through to the env
+    /// default downstream.
+    fn fetch_active_llm_topic_from_registry() -> Option<ActiveLlm> {
         const RESPONSE_TOPIC: &str = "registry.v1.response.get_active_model";
         const REQUEST_TOPIC: &str = "registry.v1.get_active_model";
         const TIMEOUT_MS: u64 = 5_000;
@@ -1481,40 +1629,41 @@ impl ReactLoop {
 
         // Registry replies with `Option<ProviderEntry>` — JSON `null`
         // means "no active model"; anything else is the active entry
-        // shape with a `request_topic` field.
+        // shape with a `request_topic` field (and the selected model `id`).
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).ok()?;
-        // `null` is the valid "no active model" reply; anything that isn't an
-        // object is a corrupt/unexpected response worth a warning rather than a
-        // silent `None` (which is indistinguishable from "no model").
-        if payload.is_null() {
-            return None;
-        }
-        let provider = payload.as_object().or_else(|| {
+        // A non-object, non-null payload is a corrupt/unexpected response
+        // worth a warning rather than a silent `None` (which is
+        // indistinguishable from "no model"). `parse_active_provider` already
+        // returns `None` for it, so warn here before delegating.
+        if !payload.is_null() && !payload.is_object() {
             log::warn("react: registry active-model response is not a JSON object");
-            None
-        })?;
-        let topic = provider.get("request_topic")?.as_str()?.to_string();
-        if topic.is_empty() {
-            return None;
         }
+        let active = parse_active_provider(&payload)?;
 
         // Best-effort cache so subsequent prompts under this principal
         // skip the round-trip. Errors are non-fatal — a transient KV
         // failure just means we'll re-fetch next time.
-        let _ = kv::set_bytes("llm_provider_topic", topic.as_bytes());
-        for (kv_key, payload_key) in [
-            (KV_CONTEXT_WINDOW, "context_window"),
-            (KV_MAX_OUTPUT_TOKENS, "max_output_tokens"),
-        ] {
-            if let Some(v) = provider
-                .get(payload_key)
-                .and_then(serde_json::Value::as_u64)
-            {
-                let _ = kv::set_bytes(kv_key, &v.to_le_bytes());
+        let _ = kv::set_bytes("llm_provider_topic", active.topic.as_bytes());
+        if let Some(model) = active.model.as_deref()
+            && !model.is_empty()
+        {
+            let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+        }
+        if let Some(provider) = payload.as_object() {
+            for (kv_key, payload_key) in [
+                (KV_CONTEXT_WINDOW, "context_window"),
+                (KV_MAX_OUTPUT_TOKENS, "max_output_tokens"),
+            ] {
+                if let Some(v) = provider
+                    .get(payload_key)
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    let _ = kv::set_bytes(kv_key, &v.to_le_bytes());
+                }
             }
         }
 
-        Some(topic)
+        Some(active)
     }
 
     /// Read cached context window from KV. Returns `None` if not yet queried.
@@ -1642,4 +1791,133 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `ActiveLlm` for tests without going through the registry.
+    fn active(topic: &str, model: Option<&str>) -> ActiveLlm {
+        ActiveLlm {
+            topic: topic.to_string(),
+            model: model.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn request_model_uses_registry_id() {
+        // The registry reply carries the selected model id under `id`,
+        // sitting next to the `request_topic` react already reads.
+        let reply = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.model.as_deref(), Some("qwen2.5-coder:32b"));
+
+        // With no override, the registry id wins over the env default —
+        // before the fix the env value always won.
+        let resolved =
+            resolve_request_model(None, &parsed, Some("claude-sonnet-4-20250514".to_string()));
+        assert_eq!(resolved, "qwen2.5-coder:32b");
+    }
+
+    #[test]
+    fn request_model_override_beats_registry() {
+        let active = active("llm.v1.request.generate.openai", Some("gpt-5.4-registry"));
+
+        // The per-request `context.model` override wins over both the
+        // registry selection and the env default.
+        let resolved =
+            resolve_request_model(Some("gpt-5.4"), &active, Some("env-model".to_string()));
+        assert_eq!(resolved, "gpt-5.4");
+
+        // An empty override is ignored — the registry id wins.
+        let resolved_empty =
+            resolve_request_model(Some(""), &active, Some("env-model".to_string()));
+        assert_eq!(resolved_empty, "gpt-5.4-registry");
+    }
+
+    #[test]
+    fn request_model_falls_back_when_no_selection() {
+        // JSON `null` is the registry's "no active model" reply.
+        assert!(parse_active_provider(&serde_json::Value::Null).is_none());
+
+        // No override, no registry model -> env model.
+        let no_model = active("llm.v1.request.generate.anthropic", None);
+        let resolved = resolve_request_model(None, &no_model, Some("env-model".to_string()));
+        assert_eq!(resolved, "env-model");
+
+        // No override, no registry model, no env -> hardcoded default.
+        let resolved_default = resolve_request_model(None, &no_model, None);
+        assert_eq!(resolved_default, DEFAULT_MODEL);
+        assert_eq!(resolved_default, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn request_model_passthrough_is_opaque() {
+        // A colon-bearing id (Ollama-style) must round-trip unmodified —
+        // react never splits a `<capsule>:<model>` qualifier.
+        let reply = serde_json::json!({
+            "id": "llama3.3:70b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.model.as_deref(), Some("llama3.3:70b"));
+
+        let resolved = resolve_request_model(None, &parsed, None);
+        assert_eq!(resolved, "llama3.3:70b");
+
+        // Same opacity for a colon-bearing `context.model` override.
+        let resolved_override =
+            resolve_request_model(Some("vendor:custom-model:v2"), &parsed, None);
+        assert_eq!(resolved_override, "vendor:custom-model:v2");
+    }
+
+    #[test]
+    fn active_provider_ignores_missing_id() {
+        // A reply with a topic but no `id` keeps the topic and reports no
+        // model — guards the migration-window cache state.
+        let reply = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.anthropic",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.topic, "llm.v1.request.generate.anthropic");
+        assert_eq!(parsed.model, None);
+
+        // The missing model falls through to the env default.
+        let resolved = resolve_request_model(None, &parsed, Some("env-model".to_string()));
+        assert_eq!(resolved, "env-model");
+    }
+
+    #[test]
+    fn active_provider_rejects_empty_topic() {
+        let reply = serde_json::json!({
+            "id": "some-model",
+            "request_topic": "",
+        });
+        assert!(parse_active_provider(&reply).is_none());
+
+        // A non-object payload is also rejected.
+        assert!(parse_active_provider(&serde_json::json!("not-an-object")).is_none());
+    }
+
+    #[test]
+    fn override_cleared_on_new_turn() {
+        let mut state = TurnState {
+            request_model_override: Some("gpt-5.4".to_string()),
+            ..TurnState::default()
+        };
+
+        // The per-iteration reset (between ReAct tool iterations within the
+        // same turn) must PRESERVE the override.
+        state.reset_turn();
+        assert_eq!(state.request_model_override.as_deref(), Some("gpt-5.4"));
+
+        // The new-turn reset (a new user prompt) must CLEAR it so the
+        // previous prompt's override does not leak forward.
+        state.reset_conversation_turn();
+        assert_eq!(state.request_model_override, None);
+    }
 }
