@@ -1147,14 +1147,26 @@ impl ReactLoop {
             }
             kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
 
-            // Cache the selected model id from the same broadcast payload
-            // (the `ProviderEntry.id`) alongside the topic. Best-effort —
-            // a cache write failure is non-fatal, consistent with the
-            // context-window cache writes below.
-            if let Some(model) = payload.get("id").and_then(|v| v.as_str())
-                && !model.is_empty()
-            {
-                let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+            // Reconcile the cached model id with the new selection from the
+            // same broadcast payload (the `ProviderEntry.id`). The topic and
+            // model must move together: a new topic with a stale model id is
+            // a foreign model name sent to the new provider.
+            //
+            // Best-effort — a cache write/delete failure is non-fatal,
+            // consistent with the context-window cache writes below.
+            match cached_model_action(&payload) {
+                ModelCacheAction::Set(model) => {
+                    let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+                }
+                // Migration-window case: the broadcast carries a valid topic
+                // but no (or an empty) `id`. The previous selection's model
+                // id must NOT survive — clearing it makes the cache-hit path
+                // in `active_llm` report `model: None`, so the new provider
+                // gets its own env/default model rather than the old
+                // provider's stale id.
+                ModelCacheAction::Clear => {
+                    let _ = kv::delete(KV_PROVIDER_MODEL);
+                }
             }
 
             // Cache context window limits from the provider metadata.
@@ -1192,6 +1204,38 @@ impl ReactLoop {
 pub(crate) struct ActiveLlm {
     topic: String,
     model: Option<String>,
+}
+
+/// What `handle_model_changed` must do to the cached model id
+/// ([`KV_PROVIDER_MODEL`]) when an `active_model_changed` broadcast lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelCacheAction {
+    /// The broadcast carries a non-empty `id`: cache it as the new model.
+    Set(String),
+    /// The broadcast carries no `id` (or an empty one) — the migration
+    /// window, where a provider was selected before the model id rode along
+    /// the broadcast. The previously cached id belongs to the *old* topic, so
+    /// it must be cleared rather than left to pair with the new topic.
+    Clear,
+}
+
+/// Decide how to reconcile the cached model id with an `active_model_changed`
+/// broadcast payload.
+///
+/// The topic and the cached model id are written together by
+/// `handle_model_changed` and read together on the cache-hit path in
+/// `active_llm`. They must therefore move as a unit: when the topic changes
+/// the cached model must change with it. A broadcast with a valid topic but no
+/// `id` ([`ModelCacheAction::Clear`]) cannot be allowed to leave the previous
+/// model id in place — `active_llm` would then pair the new topic with the old
+/// provider's model, sending a foreign model name to the new provider.
+///
+/// The `id` is read verbatim; an empty string is treated as absent.
+fn cached_model_action(payload: &serde_json::Value) -> ModelCacheAction {
+    match payload.get("id").and_then(|v| v.as_str()) {
+        Some(model) if !model.is_empty() => ModelCacheAction::Set(model.to_owned()),
+        _ => ModelCacheAction::Clear,
+    }
 }
 
 /// Parse a registry active-model reply into an [`ActiveLlm`].
@@ -1919,5 +1963,53 @@ mod tests {
         // previous prompt's override does not leak forward.
         state.reset_conversation_turn();
         assert_eq!(state.request_model_override, None);
+    }
+
+    // The KV-backed assertion the fix calls for ("pre-set KV_PROVIDER_MODEL,
+    // call handle_model_changed with a topic but no id, assert
+    // active_llm().model is None") cannot run on the host test triple: the
+    // `astrid:kv/host` WIT imports trap with "unreachable" off-wasm, so any
+    // test that touches `kv::*` aborts. The decision that the fix changed —
+    // whether the cached model id is overwritten or cleared — lives in the
+    // pure `cached_model_action`, which is what these regressions pin. The
+    // `Clear` arm is exactly what makes `active_llm`'s cache-hit path report
+    // `model: None` (line ~1568 already filters empty/absent to `None`), so a
+    // `Clear` here is the cleared-cache assertion in pure form.
+
+    #[test]
+    fn model_change_without_id_clears_stale_model() {
+        // Migration-window broadcast: a valid topic, no `id`. Before the fix
+        // the cached model id was left untouched, so the next cache hit paired
+        // the NEW topic with the OLD provider's model. The fix clears it.
+        let broadcast = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+    }
+
+    #[test]
+    fn model_change_with_empty_id_clears_stale_model() {
+        // An explicitly empty `id` is treated identically to an absent one —
+        // an empty model name is not a usable selection, and leaving the old
+        // id cached would send a foreign model to the new provider.
+        let broadcast = serde_json::json!({
+            "id": "",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+    }
+
+    #[test]
+    fn model_change_with_id_sets_model() {
+        // The normal path: a non-empty `id` is cached verbatim alongside the
+        // topic, opaque (colon-bearing ids round-trip unmodified).
+        let broadcast = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(
+            cached_model_action(&broadcast),
+            ModelCacheAction::Set("qwen2.5-coder:32b".to_string())
+        );
     }
 }
