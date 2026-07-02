@@ -981,13 +981,17 @@ impl ReactLoop {
                 // the full, authoritative text — covering non-streaming providers
                 // and acting as the source of truth — so streaming consumers
                 // accumulate these deltas and reconcile against that terminal.
-                // Failure here must be visible: a missing [publish] ACL row
-                // silently no-ops streaming for every consumer otherwise.
-                if let Err(e) = ipc::publish_json(
-                    "agent.v1.stream.delta",
-                    &stream_delta_event(text, state.session_id.clone()),
-                ) {
-                    log::warn!("stream delta publish failed: {e}");
+                // Skip empty deltas (some providers emit them): forwarding a
+                // no-op frame is pure IPC overhead in the hot streaming loop.
+                if !text.is_empty() {
+                    // Failure here must be visible: a missing [publish] ACL row
+                    // silently no-ops streaming for every consumer otherwise.
+                    if let Err(e) = ipc::publish_json(
+                        "agent.v1.stream.delta",
+                        &stream_delta_event(text, state.session_id.clone()),
+                    ) {
+                        log::warn!("stream delta publish failed: {e}");
+                    }
                 }
             }
             StreamEvent::ToolCallStart { id, name } => {
