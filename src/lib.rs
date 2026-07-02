@@ -990,7 +990,7 @@ impl ReactLoop {
                         "agent.v1.stream.delta",
                         &stream_delta_event(text, state.session_id.clone()),
                     ) {
-                        log::warn!("stream delta publish failed: {e}");
+                        log::warn(format!("stream delta publish failed: {e}"));
                     }
                 }
             }
